@@ -176,17 +176,24 @@ async function checkSeatAndRegister(clerkUserId, email) {
 // ─── Brand logo (embedded) ───────────────────────────────────
 // Generate PNG logo from canvas (jsPDF can't handle SVG)
 const LOGO_DATA_URL = (() => {
-    const c = document.createElement('canvas'); c.width = 280; c.height = 120;
+    const c = document.createElement('canvas'); c.width = 360; c.height = 140;
     const x = c.getContext('2d');
-    x.fillStyle = '#555555';
-    x.font = '400 44px Raleway, Helvetica, Arial, sans-serif';
-    x.letterSpacing = '10px';
+    // Mondial slate blue-grey background
+    x.fillStyle = '#3d5a68';
+    x.fillRect(0, 0, 360, 140);
+    // White company name
+    x.fillStyle = '#ffffff';
+    x.font = '700 48px Raleway, Helvetica, Arial, sans-serif';
+    x.letterSpacing = '6px';
     x.textAlign = 'center'; x.textBaseline = 'middle';
-    x.fillText('MONDIAL', 140, 45);
-    x.fillStyle = '#999999';
-    x.font = '400 20px Raleway, Helvetica, Arial, sans-serif';
-    x.letterSpacing = '4px';
-    x.fillText('ceramique \u00B7 pierre', 140, 90);
+    x.fillText('MONDIAL', 180, 55);
+    // Teal diamond + "entrepôt" + yellow diamond + "boutique"
+    x.font = '400 14px Raleway, Helvetica, Arial, sans-serif';
+    x.letterSpacing = '2px';
+    x.fillStyle = '#5fb8c2';
+    x.fillText('\u25C6 entrepôt', 120, 100);
+    x.fillStyle = '#e8c840';
+    x.fillText('\u25C6 boutique', 240, 100);
     return c.toDataURL('image/png');
 })();
 // ─────────────────────────────────────────────────────────────
@@ -6904,7 +6911,7 @@ document.getElementById('btn-gen-proposal').addEventListener('click', generatePr
 function quoteFilename(ext) {
     const order = (formData.order || 'XXXX').replace(/[^a-zA-Z0-9_-]/g, '-');
     const job   = (formData.job   || 'Quote').replace(/[^a-zA-Z0-9_-]/g, '_');
-    return `IN-${order}_${job}.${ext}`;
+    return `MND-${order}_${job}.${ext}`;
 }
 
 // ── Save Quote ────────────────────────────────────────────────
@@ -7106,23 +7113,14 @@ function exportPDF() {
         doc.text('MONDIAL', PW / 2, PH - 19, { align:'center' });
     }
 
-    // ── Header banner (army olive) ────────────────────────────
+    // ── Header banner (Mondial slate blue-grey) ────────────────
     doc.setFillColor(...BRAND);
     doc.rect(0, 0, PW, 70, 'F');
-    // khaki accent stripe at bottom
+    // teal accent stripe at bottom
     doc.setFillColor(...ACCENT);
     doc.rect(0, 68, PW, 2.5, 'F');
-    // Logo image (left side)
-    doc.addImage(LOGO_DATA_URL, 'PNG', ML, 8, 48, 48);
-    // Company name + tagline (offset right of logo)
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(17);
-    doc.setTextColor(255, 255, 255);
-    doc.text('MONDIAL', ML + 58, 30);
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(9);
-    doc.setTextColor(...ACCENT);
-    doc.text('Countertop Quote', ML + 58, 48);
+    // Logo image (left side — wide horizontal logo)
+    doc.addImage(LOGO_DATA_URL, 'PNG', ML, 6, 130, 56);
     // right side — order & date
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(9);
@@ -7346,15 +7344,7 @@ async function exportLayoutPDF() {
         doc.rect(0, 0, PW, 70, 'F');
         doc.setFillColor(...ACCENT);
         doc.rect(0, 68, PW, 2.5, 'F');
-        doc.addImage(LOGO_DATA_URL, 'PNG', ML, 8, 48, 48);
-        doc.setFont('helvetica', 'bold');
-        doc.setFontSize(17);
-        doc.setTextColor(255, 255, 255);
-        doc.text('MONDIAL', ML + 58, 30);
-        doc.setFont('helvetica', 'normal');
-        doc.setFontSize(9);
-        doc.setTextColor(...ACCENT);
-        doc.text(subtitle || 'Layout Overview', ML + 58, 48);
+        doc.addImage(LOGO_DATA_URL, 'PNG', ML, 6, 130, 56);
         doc.setFont('helvetica', 'bold');
         doc.setFontSize(9);
         doc.setTextColor(255, 255, 255);
@@ -8501,11 +8491,7 @@ async function kitExportPDF() {
     const BRAND = [61, 90, 104], ACCENT = [95, 184, 194];
     doc.setFillColor(...BRAND); doc.rect(0, 0, PW, 70, 'F');
     doc.setFillColor(...ACCENT); doc.rect(0, 68, PW, 2.5, 'F');
-    doc.addImage(LOGO_DATA_URL, 'PNG', ML, 8, 48, 48);
-    doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor(255, 255, 255);
-    doc.text('MONDIAL', ML + 58, 30);
-    doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...ACCENT);
-    doc.text('Stone Simulation — Kitchen Layout', ML + 58, 48);
+    doc.addImage(LOGO_DATA_URL, 'PNG', ML, 6, 130, 56);
     doc.setFont('helvetica', 'bold'); doc.setFontSize(9); doc.setTextColor(255, 255, 255);
     doc.text(`Quote #: ${formData.order || '—'}`, PW - MR, 30, { align: 'right' });
     doc.setFont('helvetica', 'normal'); doc.setTextColor(...ACCENT);
