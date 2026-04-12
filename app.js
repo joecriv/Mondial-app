@@ -5675,6 +5675,23 @@ function slabPieceOverlaps(slabIdx, x, y, w, h, excludeId, inRef, inRot) {
     return false;
 }
 
+function slabPieceInDeadZone(slabIdx, x, y, w, h, ref, rotation) {
+    const sd = slabDefs[slabIdx];
+    if (!sd) return false;
+    const dz = sd.deadZone || 0;
+    if (dz <= 0) return false;
+    const usableW = sd.w - 2 * dz;
+    const usableH = sd.h - 2 * dz;
+    if (ref) {
+        const poly = piecePolyInches(x, y, ref, rotation || 0);
+        for (const [px, py] of poly) {
+            if (px < 0 || py < 0 || px > usableW || py > usableH) return true;
+        }
+        return false;
+    }
+    return x < 0 || y < 0 || x + w > usableW || y + h > usableH;
+}
+
 function slabAllPieces() {
     // Returns piece entries for all placeable shapes/segments in the quote.
     // Shapes with joints are split into individual segment entries.
@@ -6002,7 +6019,7 @@ function slabDrawSlab(ctx, sd, idx, ox, oy, sc, mockupMode) {
         const shape = page ? page.shapes[p.ref.shapeIdx] : null;
         const shapeType = shape ? (shape.shapeType || 'rect') : 'rect';
         const segPoly = p.ref.segPoly || null; // exact polygon for irregular segments
-        const isOverlapping = slabPieceOverlaps(idx, p.x, p.y, pw, ph, p.id, p.ref, p.rotation||0);
+        const isOverlapping = slabPieceOverlaps(idx, p.x, p.y, pw, ph, p.id, p.ref, p.rotation||0) || slabPieceInDeadZone(idx, p.x, p.y, pw, ph, p.ref, p.rotation||0);
 
         ctx.save();
 
