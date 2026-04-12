@@ -67,37 +67,37 @@ async function pullFromRemote() {
 // ── Seat enforcement ────────────────────────────────────────
 // Returns { allowed: true, shopId } or { allowed: false, reason }
 async function checkSeatAndRegister(clerkUserId, email) {
-    // 1. Is this user already registered to a shop?
+    const shopId = BRAND.shopId;
+    if (!shopId) return { allowed: false, reason: 'No shop configured in config.js.' };
+    // 1. Is this user already registered to THIS shop?
     const { data: existing } = await _sb.from('shop_users')
         .select('shop_id')
         .eq('clerk_user_id', clerkUserId)
+        .eq('shop_id', shopId)
         .maybeSingle();
     if (existing) {
-        return { allowed: true, shopId: existing.shop_id };
+        return { allowed: true, shopId };
     }
-    // 2. New user — find the shop (for now, use the first/only shop)
-    const { data: shops } = await _sb.from('shops')
+    // 2. Check seat limit for this shop
+    const { data: shop } = await _sb.from('shops')
         .select('id, name, max_seats')
-        .limit(1);
-    if (!shops || !shops.length) {
-        return { allowed: false, reason: 'No shop configured. Contact the administrator.' };
-    }
-    const shop = shops[0];
-    // 3. Count existing users in this shop
+        .eq('id', shopId)
+        .single();
+    if (!shop) return { allowed: false, reason: 'Shop not found. Contact the administrator.' };
     const { count } = await _sb.from('shop_users')
         .select('id', { count: 'exact', head: true })
-        .eq('shop_id', shop.id);
+        .eq('shop_id', shopId);
     if (count >= shop.max_seats) {
         return { allowed: false, reason: `Seat limit reached (${shop.max_seats}/${shop.max_seats}). Contact the administrator to add more seats.` };
     }
-    // 4. Register the new user
+    // 3. Register the new user to THIS shop
     await _sb.from('shop_users').insert({
-        shop_id: shop.id,
+        shop_id: shopId,
         clerk_user_id: clerkUserId,
         email: email,
         role: 'member'
     });
-    return { allowed: true, shopId: shop.id };
+    return { allowed: true, shopId };
 }
 
 // ── Clerk initialization ────────────────────────────────────
