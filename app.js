@@ -4240,6 +4240,8 @@ const SERVICE_RATE_DEFS = [
     { key:'fini45',        label:'Fini 45',         desc:'Finition laminée en 45',                             unit:'lf' },
     { key:'lamine',        label:'Lamine',          desc:'Assemblage des morceaux (Laminage)',                  unit:'lf' },
     { key:'polissageSous', label:'Polissage sous',  desc:'Polissage sous morceau',                             unit:'each' },
+    { key:'installation',  label:'Installation',    desc:'Installation',                                       unit:'sqft' },
+    { key:'measurements',  label:'Measurements',    desc:'Measurements',                                       unit:'flat' },
 ];
 const DEFAULT_RATES = {};
 SERVICE_RATE_DEFS.forEach(d => DEFAULT_RATES[d.key] = 0);
@@ -4850,6 +4852,7 @@ function calcServiceQtys() {
     let pencilLf = 0, coupeSqft = 0, dektonCoupeSqft = 0;
     let evierOver = 0, evierUnder = 0, evierVasque = 0;
     let fini45Lf = 0, lamineLf = 0;
+    let totalSqft = 0;
     for (const page of pages) {
         // Pencil linear feet
         pencilLf += calcPageEdgeLinearFt(page, 'pencil') + calcPageEdgeLinearFt(page, 'polished');
@@ -4871,6 +4874,7 @@ function calcServiceQtys() {
             if (s.shapeType === 'circle') area = Math.PI * (s.w/2) * (s.h/2);
             if (s.farmSink) area -= (FS_WIDTH_IN * INCH) * (FS_DEPTH_IN * INCH);
             const sqft = area / SQFT_PX2;
+            totalSqft += sqft;
             // Check if material is Dekton
             const mid = s.materialId || (formData.materials[0] && formData.materials[0].id) || 0;
             const mat = formData.materials.find(m => m.id === mid) || {};
@@ -4881,11 +4885,14 @@ function calcServiceQtys() {
             else coupeSqft += sqft;
         }
     }
+    const measurementsQty = (pricingData.measurementsEnabled === false) ? 0 : 1;
     return {
         pencilLf, coupeSqft, dektonCoupeSqft,
         evierOver, evierUnder, evierVasque,
         fini45Lf, lamineLf,
-        polissageSousQty: pricingData.polissageSousQty || 0
+        polissageSousQty: pricingData.polissageSousQty || 0,
+        installationSqft: totalSqft,
+        measurementsQty
     };
 }
 
@@ -4905,6 +4912,8 @@ function getServiceLineItems() {
             case 'fini45':        qty = q.fini45Lf;          unitLabel = `${qty.toFixed(2)} lin ft`; break;
             case 'lamine':        qty = q.lamineLf;          unitLabel = `${qty.toFixed(2)} lin ft`; break;
             case 'polissageSous': qty = q.polissageSousQty;  unitLabel = `× ${qty}`; break;
+            case 'installation':  qty = q.installationSqft;  unitLabel = `${qty.toFixed(2)} sqft`; break;
+            case 'measurements':  qty = q.measurementsQty;   unitLabel = qty ? 'flat fee' : 'disabled'; break;
         }
         const rate = R[d.key] || 0;
         const cost = qty * rate;
@@ -5052,7 +5061,7 @@ function renderPricingPanel() {
 
     // ── Service line items (only show if qty > 0) ────────────
     // Exclude polissageSous from auto list — it has its own toggle below
-    const items = getServiceLineItems().filter(i => i.key !== 'polissageSous' && i.qty > 0);
+    const items = getServiceLineItems().filter(i => i.key !== 'polissageSous' && i.key !== 'measurements' && i.qty > 0);
     let serviceCostTotal = items.reduce((s, i) => s + i.cost, 0);
 
     if (items.length) {
@@ -5084,6 +5093,23 @@ function renderPricingPanel() {
             <input class="mat-input" id="pricing-ps-qty" type="number" min="1" step="1" value="${psQty || 1}" style="width:50px;text-align:right">
             <span style="font-size:10px;color:#999">× ${fmt$(psRate)}</span>
             <span style="font-size:11px;font-weight:700;color:#5fb8c2;margin-left:auto">${psEnabled ? fmt$(psCost) : ''}</span>
+        </div>
+    </div>`;
+
+    // ── Measurements toggle ──────────────────────────────────
+    const mEnabled = pricingData.measurementsEnabled !== false;
+    const mRate = pricingData.rates.measurements || 0;
+    const mCost = mEnabled ? mRate : 0;
+    if (mEnabled) serviceCostTotal += mCost;
+
+    sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px">
+        <div style="display:flex;align-items:center;gap:8px">
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:11px;color:#e0ddd5">
+                <input type="checkbox" id="pricing-meas-toggle" ${mEnabled ? 'checked' : ''} style="cursor:pointer">
+                Measurements (flat fee)
+            </label>
+            <span style="font-size:10px;color:#999;margin-left:auto">${mEnabled ? fmt$(mRate) : 'disabled'}</span>
+            <span style="font-size:11px;font-weight:700;color:#5fb8c2">${mEnabled ? fmt$(mCost) : ''}</span>
         </div>
     </div>`;
 
@@ -5127,6 +5153,12 @@ function renderPricingPanel() {
     const psQtyInp = document.getElementById('pricing-ps-qty');
     if (psQtyInp) psQtyInp.addEventListener('input', e => {
         pricingData.polissageSousQty = parseInt(e.target.value) || 0;
+        savePricing(); renderPricingPanel();
+    });
+    // Measurements toggle
+    const measToggle = document.getElementById('pricing-meas-toggle');
+    if (measToggle) measToggle.addEventListener('change', e => {
+        pricingData.measurementsEnabled = e.target.checked;
         savePricing(); renderPricingPanel();
     });
 }
