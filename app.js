@@ -3477,34 +3477,48 @@ cv.addEventListener('mousedown', e => {
                     else if (eh.s.shapeType === 'l' || eh.s.shapeType === 'u') eh.s.edges = {};
                     else eh.s.edges = {top:{type:'none'},right:{type:'none'},bottom:{type:'none'},left:{type:'none'}};
                 }
-                eh.s.edges[eh.key] = { type: 'mitered' };
-                // Compute edge length and direction from actual edge coordinates
-                const edgeLenPx = Math.hypot(eh.x2 - eh.x1, eh.y2 - eh.y1);
-                const edgeLenIn = edgeLenPx / INCH;
+                // Determine the segment coordinates — if the edge is split, use only the clicked segment
+                let segX1 = eh.x1, segY1 = eh.y1, segX2 = eh.x2, segY2 = eh.y2;
+                const edgeData = eh.s.edges[eh.key];
+                if (edgeData?.type === 'segmented' && edgeData.segments?.length) {
+                    const fullLen = Math.hypot(eh.x2 - eh.x1, eh.y2 - eh.y1);
+                    const dx = (eh.x2 - eh.x1) / fullLen, dy = (eh.y2 - eh.y1) / fullLen;
+                    const t = Math.max(0, Math.min(1, ((p.x - eh.x1)*(eh.x2-eh.x1) + (p.y - eh.y1)*(eh.y2-eh.y1)) / (fullLen*fullLen)));
+                    const clickPx = t * fullLen;
+                    let cursor = 0;
+                    for (const seg of edgeData.segments) {
+                        const segPx = seg.length * INCH;
+                        if (clickPx <= cursor + segPx) {
+                            seg.profile = 'mitered';
+                            segX1 = eh.x1 + dx * cursor;
+                            segY1 = eh.y1 + dy * cursor;
+                            segX2 = eh.x1 + dx * (cursor + segPx);
+                            segY2 = eh.y1 + dy * (cursor + segPx);
+                            break;
+                        }
+                        cursor += segPx;
+                    }
+                } else {
+                    eh.s.edges[eh.key] = { type: 'mitered' };
+                }
+                const segLenPx = Math.hypot(segX2 - segX1, segY2 - segY1);
                 const miterPx = miterW * INCH;
                 const gapPx = 2 * INCH;
-                // Edge midpoint and outward normal
-                const emx = (eh.x1 + eh.x2) / 2, emy = (eh.y1 + eh.y2) / 2;
-                const edx = eh.x2 - eh.x1, edy = eh.y2 - eh.y1;
+                const edx = segX2 - segX1, edy = segY2 - segY1;
                 const elen = Math.hypot(edx, edy) || 1;
-                // Outward normal (right of CW winding = outward)
                 const onx = edy / elen, ony = -edx / elen;
-                // Determine if edge is roughly horizontal or vertical
                 const isHoriz = Math.abs(edx) > Math.abs(edy);
                 let stripW, stripH, stripX, stripY;
                 if (isHoriz) {
-                    // Horizontal edge — strip runs along it
-                    stripW = edgeLenPx; stripH = miterPx;
-                    stripX = Math.min(eh.x1, eh.x2);
-                    // Place on the outward side with 2" gap
-                    if (ony > 0) stripY = Math.max(eh.y1, eh.y2) + gapPx;       // outward = down
-                    else         stripY = Math.min(eh.y1, eh.y2) - miterPx - gapPx; // outward = up
+                    stripW = segLenPx; stripH = miterPx;
+                    stripX = Math.min(segX1, segX2);
+                    if (ony > 0) stripY = Math.max(segY1, segY2) + gapPx;
+                    else         stripY = Math.min(segY1, segY2) - miterPx - gapPx;
                 } else {
-                    // Vertical edge — strip runs along it
-                    stripW = miterPx; stripH = edgeLenPx;
-                    stripY = Math.min(eh.y1, eh.y2);
-                    if (onx > 0) stripX = Math.max(eh.x1, eh.x2) + gapPx;       // outward = right
-                    else         stripX = Math.min(eh.x1, eh.x2) - miterPx - gapPx; // outward = left
+                    stripW = miterPx; stripH = segLenPx;
+                    stripY = Math.min(segY1, segY2);
+                    if (onx > 0) stripX = Math.max(segX1, segX2) + gapPx;
+                    else         stripX = Math.min(segX1, segX2) - miterPx - gapPx;
                 }
                 stripX = clamp(stripX, 0, CW - stripW);
                 stripY = clamp(stripY, 0, CH - stripH);
