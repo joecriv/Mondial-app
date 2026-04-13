@@ -1096,7 +1096,38 @@ function nearestEdge(mx, my) {
 function nearestCornerForEdge(mx, my) {
     const THRESH = 18;
     for (const s of shapes) {
-        if (s.shapeType === 'l' || s.shapeType === 'u' || s.shapeType === 'bsp' || s.shapeType === 'circle') continue;
+        if (s.shapeType === 'bsp' || s.shapeType === 'circle') continue;
+        // L-shape: each vertex can have a radius. Pick the arc midpoint via pin/pout.
+        if (s.shapeType === 'l') {
+            const verts = lShapeVerts(s);
+            for (let i = 0; i < verts.length; i++) {
+                const nv = verts[i];
+                if (!(nv.r > 0)) continue;
+                // Arc midpoint ≈ midpoint of pin→pout swept around curr
+                const midX = (nv.pin[0] + nv.pout[0]) / 2;
+                const midY = (nv.pin[1] + nv.pout[1]) / 2;
+                // Push outward from curr by a small factor so the pick point lands on the arc
+                const dx = midX - nv.curr[0], dy = midY - nv.curr[1];
+                const d = Math.hypot(dx, dy) || 1;
+                const mpx = nv.curr[0] + (dx/d) * nv.r;
+                const mpy = nv.curr[1] + (dy/d) * nv.r;
+                if (Math.hypot(mx - mpx, my - mpy) < THRESH) return { s, key: `lc${i}`, px: mpx, py: mpy };
+            }
+            continue;
+        }
+        // U-shape: radius via s.corners.uc{i} (rendered via polygon approximation — treated best-effort)
+        if (s.shapeType === 'u') {
+            const poly = uShapePolygon(s);
+            const n = poly.length;
+            for (let i = 0; i < n; i++) {
+                const rad = (s.corners && s.corners[`uc${i}`]) || 0;
+                if (rad <= 0) continue;
+                const px = poly[i][0], py = poly[i][1];
+                if (Math.hypot(mx - px, my - py) < THRESH) return { s, key: `uc${i}`, px, py };
+            }
+            continue;
+        }
+        // Rectangle (default)
         const r = shapeRadii(s);
         const corners = [
             { key:'nw', cx:s.x+r.nw,     cy:s.y+r.nw,     startA:Math.PI,       endA:1.5*Math.PI, r:r.nw },
@@ -1804,13 +1835,46 @@ function drawLShape(s, sel) {
                     }
                 }
             } else {
-                ctx.save(); ctx.strokeStyle=sel?'#5fb8c2':'#222222'; ctx.lineWidth=sel?2:0.8; ctx.setLineDash([]);
+                // Radius arc — honor cornerEdges[lc_i].type styling (same palette as rect corner arcs)
+                const lckey = `lc${(i+1)%n}`;
+                const ctype = s.cornerEdges?.[lckey]?.type || 'none';
+                ctx.save();
+                if (sel && ctype === 'none') { ctx.strokeStyle = '#5fb8c2'; ctx.lineWidth = 2; ctx.setLineDash([]); }
+                else if (ctype === 'none')   { ctx.strokeStyle = '#222222'; ctx.lineWidth = 0.8; ctx.setLineDash([]); }
+                else if (ctype === 'polished' || ctype === 'pencil') { ctx.strokeStyle = '#dd0000'; ctx.lineWidth = 2.5; ctx.setLineDash([]); }
+                else if (ctype === 'ogee')      { ctx.strokeStyle = '#cc44cc'; ctx.lineWidth = 2.5; ctx.setLineDash([]); }
+                else if (ctype === 'bullnose')  { ctx.strokeStyle = '#0088dd'; ctx.lineWidth = 4;   ctx.setLineDash([]); }
+                else if (ctype === 'halfbull')  { ctx.strokeStyle = '#00aa66'; ctx.lineWidth = 2.5; ctx.setLineDash([]); }
+                else if (ctype === 'bevel')     { ctx.strokeStyle = '#dd8800'; ctx.lineWidth = 2.5; ctx.setLineDash([]); }
+                else if (ctype === 'mitered')   { ctx.strokeStyle = '#7a3000'; ctx.lineWidth = 2;   ctx.setLineDash([4,3]); }
+                else if (ctype === 'special')   { ctx.strokeStyle = '#228B22'; ctx.lineWidth = 2.5; ctx.setLineDash([]); }
+                else if (ctype === 'joint')     { ctx.strokeStyle = '#e0457b'; ctx.lineWidth = 2;   ctx.setLineDash([5,4]); }
+                else if (ctype === 'waterfall') { ctx.strokeStyle = '#006688'; ctx.lineWidth = 2;   ctx.setLineDash([]); }
                 ctx.beginPath(); ctx.moveTo(nv.pin[0],nv.pin[1]);
                 ctx.arcTo(nv.curr[0],nv.curr[1],nv.pout[0],nv.pout[1],nv.r); ctx.stroke();
-                const lx=nv.curr[0], ly=nv.curr[1];
-                ctx.font='8px Raleway,sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
-                ctx.lineWidth=3; ctx.strokeStyle='rgba(255,255,255,0.8)';
-                ctx.strokeText(`R${pxToIn(nv.r)}"`,lx,ly); ctx.fillStyle='#cc4444'; ctx.fillText(`R${pxToIn(nv.r)}"`,lx,ly);
+                // Edge profile abbreviation badge near arc midpoint
+                const def = EDGE_DEFS[ctype];
+                if (ctype !== 'none' && def?.abbr) {
+                    const midX = (nv.pin[0] + nv.pout[0]) / 2;
+                    const midY = (nv.pin[1] + nv.pout[1]) / 2;
+                    const odx = midX - nv.curr[0], ody = midY - nv.curr[1];
+                    const od = Math.hypot(odx, ody) || 1;
+                    const arcMx = nv.curr[0] + (odx/od) * nv.r;
+                    const arcMy = nv.curr[1] + (ody/od) * nv.r;
+                    const ox = (odx/od) * 12, oy = (ody/od) * 12;
+                    ctx.setLineDash([]);
+                    ctx.font='bold 9px Raleway,sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+                    ctx.lineWidth=3; ctx.strokeStyle='rgba(255,255,255,0.85)';
+                    ctx.strokeText(def.abbr, arcMx+ox, arcMy+oy);
+                    ctx.fillStyle = def.color; ctx.fillText(def.abbr, arcMx+ox, arcMy+oy);
+                }
+                // Radius label (only when no edge profile — otherwise it crowds the badge)
+                if (ctype === 'none') {
+                    const lx=nv.curr[0], ly=nv.curr[1];
+                    ctx.font='8px Raleway,sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+                    ctx.lineWidth=3; ctx.strokeStyle='rgba(255,255,255,0.8)';
+                    ctx.strokeText(`R${pxToIn(nv.r)}"`,lx,ly); ctx.fillStyle='#cc4444'; ctx.fillText(`R${pxToIn(nv.r)}"`,lx,ly);
+                }
                 ctx.restore();
             }
         }
@@ -4238,6 +4302,7 @@ const SERVICE_RATE_DEFS = [
     { key:'evierUnder',    label:'Evier under',     desc:'Trou et polissage pour evier sous plan (undermount)',unit:'each' },
     { key:'evierVasque',   label:'Evier vasque',    desc:'Trou pour lavabo type vasque',                       unit:'each' },
     { key:'cooktop',       label:'Cooktop',         desc:'Trou pour cuisinière (cooktop)',                     unit:'each' },
+    { key:'farmSink',      label:'Farmhouse sink',  desc:'Évier farmhouse (intégré)',                          unit:'each' },
     { key:'fini45',        label:'Fini 45',         desc:'Finition laminée en 45',                             unit:'lf' },
     { key:'lamine',        label:'Lamine',          desc:'Assemblage des morceaux (Laminage)',                  unit:'lf' },
     { key:'polissageSous', label:'Polissage sous',  desc:'Polissage sous morceau',                             unit:'each' },
@@ -4293,6 +4358,7 @@ function loadForm() {
     } catch(e) {}
     if (!formData.phones) formData.phones = [''];
     if (!formData.address) formData.address = '';
+    migrateMaterialTypes();
     document.getElementById('f-order').value   = formData.order   || '';
     document.getElementById('f-job').value     = formData.job     || '';
     document.getElementById('f-client').value  = formData.client  || '';
@@ -4316,10 +4382,18 @@ function matHtml(m) {
     // Get unique brands
     const brands = [...new Set(matDb.map(d => d.supplier).filter(Boolean))].sort();
     const selBrand = (m.dbId ? (matDb.find(d=>d.id===m.dbId)||{}).supplier : '') || m._brand || m.supplier || '';
+    // Resilience: if the stored brand isn't in the catalog (e.g., catalog not yet loaded),
+    // add it to the options so the selection is visually preserved.
+    const brandOpts = [...new Set([...brands, selBrand].filter(Boolean))].sort();
     // Colors for selected brand
     const colors = selBrand ? matDb.filter(d => d.supplier === selBrand) : [];
     const selDbId = m.dbId || 0;
     const linked = matDb.find(d => d.id === selDbId);
+    // If we have a stored color name but the catalog entry isn't present (stale matDb),
+    // keep the stored color visible in the color dropdown as a fallback option.
+    const fallbackColorOpt = (!linked && selDbId && m.color)
+        ? `<option value="${selDbId}" selected>${m.color}</option>`
+        : '';
     // Finishes + thicknesses from linked color
     const availFinishes = linked ? (linked.finishes||[]) : [];
     const availThick = linked ? (linked.thicknesses||[]) : [];
@@ -4328,32 +4402,41 @@ function matHtml(m) {
     const slabStr = linked ? `${linked.slabW||'?'}" × ${linked.slabH||'?'}"` : '';
     const costStr = linked ? `Cost/slab: ${linked.costPerSlab ? fmt$(linked.costPerSlab) : 'not set'}` : '';
 
-    const selType = m.type || 'zone';
-    const labelPlaceholder = selType === 'option' ? `auto: Option ${getOptionLetter(m)}`
-                            : selType === 'page'  ? 'Page name (e.g. Kitchen, Bathroom)'
-                            : 'Zone name (e.g. Island, Perimeter)';
+    const selType = (m.type === 'option' || m.type === 'page') ? m.type : 'page';
+    const optionPlaceholder = `Option ${getOptionLetter(m)} (editable)`;
+    // Build the Label control: page selector for Page type, editable text for Option
+    let labelControl;
+    if (selType === 'page') {
+        labelControl = `<select class="mat-input mat-page-sel" data-mid="${m.id}" style="width:100%">
+            <option value="">— Select page —</option>
+            ${pages.map(p => `<option value="${p.id}" ${m.pageId === p.id ? 'selected' : ''}>${p.name}</option>`).join('')}
+        </select>`;
+    } else {
+        labelControl = `<input class="mat-input mat-label-inp" data-mid="${m.id}" type="text" style="width:100%" value="${(m.label||'').replace(/"/g,'&quot;')}" placeholder="${optionPlaceholder}">`;
+    }
+    const labelHdr = selType === 'page' ? 'Page (canvas tab)' : 'Label';
     return `<div class="mat-row" id="mat-${m.id}">
         <button class="mat-remove" onclick="removeMaterial(${m.id})" title="Remove">×</button>
         <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:4px">
             <div style="flex:1;min-width:80px"><span class="mat-lbl">Type</span>
                 <select class="mat-input mat-type-sel" data-mid="${m.id}" style="width:100%">
-                    <option value="zone"   ${selType==='zone'  ?'selected':''}>Zone</option>
-                    <option value="option" ${selType==='option'?'selected':''}>Option</option>
                     <option value="page"   ${selType==='page'  ?'selected':''}>Page</option>
+                    <option value="option" ${selType==='option'?'selected':''}>Option</option>
                 </select></div>
-            <div style="flex:2;min-width:120px"><span class="mat-lbl">Label</span>
-                <input class="mat-input mat-label-inp" data-mid="${m.id}" type="text" style="width:100%" value="${(m.label||'').replace(/"/g,'&quot;')}" placeholder="${labelPlaceholder}" ${selType==='option'?'readonly':''}>
+            <div style="flex:2;min-width:120px"><span class="mat-lbl">${labelHdr}</span>
+                ${labelControl}
             </div>
         </div>
         <div style="display:flex;gap:4px;flex-wrap:wrap">
             <div style="flex:1;min-width:80px"><span class="mat-lbl">Brand</span>
                 <select class="mat-input mat-brand-sel" data-mid="${m.id}" style="width:100%">
                     <option value="">— Brand —</option>
-                    ${brands.map(b => `<option value="${b}" ${b===selBrand?'selected':''}>${b}</option>`).join('')}
+                    ${brandOpts.map(b => `<option value="${b}" ${b===selBrand?'selected':''}>${b}</option>`).join('')}
                 </select></div>
             <div style="flex:2;min-width:120px"><span class="mat-lbl">Color</span>
                 <select class="mat-input mat-color-sel" data-mid="${m.id}" style="width:100%">
                     <option value="0">— Color —</option>
+                    ${fallbackColorOpt}
                     ${colors.map(c => `<option value="${c.id}" ${c.id===selDbId?'selected':''}>${c.name}</option>`).join('')}
                 </select></div>
         </div>
@@ -4381,15 +4464,37 @@ function renderMaterials() {
         const m = formData.materials.find(m => m.id === +e.target.dataset.mid);
         if (!m) return;
         m.type = e.target.value;
-        // Auto-assign Option label; clear zone/page labels that equal a prior auto-Option label
-        if (m.type === 'option') m.label = `Option ${getOptionLetter(m)}`;
-        else if (/^Option [A-Z]$/.test(m.label||'')) m.label = '';
+        if (m.type === 'option') {
+            // Switching to Option — set default label if empty or a page name
+            m.pageId = null;
+            if (!m.label || /^Option [A-Z]$/.test(m.label)) m.label = `Option ${getOptionLetter(m)}`;
+        } else if (m.type === 'page') {
+            // Switching to Page — auto-link to current page if no link exists
+            if (m.pageId == null) {
+                const curPage = pages[currentPageIdx] || pages[0];
+                m.pageId = curPage ? curPage.id : null;
+                m.label = curPage ? curPage.name : '';
+            } else {
+                const p = pages.find(pg => pg.id === m.pageId);
+                if (p) m.label = p.name;
+            }
+        }
         saveForm(); renderMaterials(); renderPricingPanel();
     }));
-    // Label input (zone/page only; option is read-only auto)
+    // Page selector (for type=page)
+    document.querySelectorAll('.mat-page-sel').forEach(sel => sel.addEventListener('change', e => {
+        const m = formData.materials.find(m => m.id === +e.target.dataset.mid);
+        if (!m) return;
+        const pid = +e.target.value;
+        m.pageId = pid || null;
+        const p = pages.find(pg => pg.id === pid);
+        m.label = p ? p.name : '';
+        saveForm(); renderPricingPanel();
+    }));
+    // Label input — for Option type (editable free text)
     document.querySelectorAll('.mat-label-inp').forEach(inp => inp.addEventListener('input', e => {
         const m = formData.materials.find(m => m.id === +e.target.dataset.mid);
-        if (!m || (m.type||'zone') === 'option') return;
+        if (!m) return;
         m.label = e.target.value;
         saveForm(); renderPricingPanel();
     }));
@@ -4414,7 +4519,15 @@ function renderMaterials() {
 }
 
 function addMaterial() {
-    const m = { id: matNextId++, color:'', supplier:'', thickness:'3cm', finish:'Polished', type:'zone', label:'' };
+    // Default new materials to 'page' type, auto-linked to the current canvas page
+    const curPage = (pages && pages[currentPageIdx]) || (pages && pages[0]);
+    const m = {
+        id: matNextId++,
+        color:'', supplier:'', thickness:'3cm', finish:'Polished',
+        type: 'page',
+        pageId: curPage ? curPage.id : null,
+        label: curPage ? curPage.name : ''
+    };
     formData.materials.push(m);
     saveForm(); renderMaterials();
     // Focus first input of the new row
@@ -4425,16 +4538,53 @@ function addMaterial() {
 // Helper: auto-assign Option letters (A, B, C…) based on ordinal position among Options
 function getOptionLetter(mat) {
     const mats = formData.materials || [];
-    const options = mats.filter(mm => (mm.type||'zone') === 'option');
+    const options = mats.filter(mm => (mm.type||'page') === 'option');
     const idx = options.findIndex(mm => mm.id === mat.id);
     return idx >= 0 ? String.fromCharCode(65 + idx) : '?';
 }
+// Resolve a Page-type material's linked page (by pageId, falling back to label==name)
+function getLinkedPage(mat) {
+    if (!mat) return null;
+    if (mat.pageId != null) {
+        const p = pages.find(pg => pg.id === mat.pageId);
+        if (p) return p;
+    }
+    if (mat.label) {
+        const p = pages.find(pg => pg.name === mat.label);
+        if (p) return p;
+    }
+    return null;
+}
 function defaultLabelForType(mat) {
-    const t = mat.type || 'zone';
+    const t = mat.type || 'page';
     if (t === 'option') return `Option ${getOptionLetter(mat)}`;
-    if (t === 'zone')   return 'Zone';
-    if (t === 'page')   return 'Page';
+    if (t === 'page')   {
+        const p = getLinkedPage(mat);
+        return p ? p.name : 'Page';
+    }
     return '';
+}
+
+// Migrate legacy materials: 'zone' type → 'page' type, auto-link to first page
+function migrateMaterialTypes() {
+    if (!formData.materials || !pages || !pages.length) return;
+    let changed = false;
+    for (const m of formData.materials) {
+        const t = m.type || '';
+        if (t === '' || t === 'zone') {
+            m.type = 'page';
+            if (m.pageId == null) m.pageId = pages[0].id;
+            m.label = (pages.find(p => p.id === m.pageId) || pages[0]).name;
+            changed = true;
+        } else if (t === 'page' && m.pageId == null) {
+            // Page-type with no pageId — try to resolve via label, else default to first page
+            const byName = pages.find(p => p.name === m.label);
+            m.pageId = byName ? byName.id : pages[0].id;
+            if (!byName) m.label = pages[0].name;
+            changed = true;
+        }
+    }
+    if (changed) saveForm();
 }
 
 function removeMaterial(id) {
@@ -4819,15 +4969,22 @@ function calcPageEdgeLinearFt(page, edgeType) {
             for (const sd of sides) {
                 totalPx += edgeContribPx(s, sd.key, sd.x1, sd.y1, sd.x2, sd.y2, edgeType);
             }
-            // chamfer diagonals on L-shapes
+            // L-shape per-vertex corner treatments (chamfer diagonals AND radius arcs)
             if (typeof lShapeVerts === 'function') {
                 const verts = lShapeVerts(s);
                 for (let i = 0; i < verts.length; i++) {
                     const nv = verts[i];
                     if (nv.t > 0 && nv.r === 0) {
+                        // chamfer diagonal
                         const dk = `diag_lc${i}`;
                         if (s.chamferEdges?.[dk]?.type === edgeType) {
                             totalPx += Math.hypot(nv.pout[0]-nv.pin[0], nv.pout[1]-nv.pin[1]);
+                        }
+                    } else if (nv.r > 0) {
+                        // radius arc (quarter-circle length)
+                        const ck = `lc${i}`;
+                        if (s.cornerEdges?.[ck]?.type === edgeType) {
+                            totalPx += Math.PI / 2 * nv.r;
                         }
                     }
                 }
@@ -4836,6 +4993,14 @@ function calcPageEdgeLinearFt(page, edgeType) {
             const sides = uShapeSides(s);
             for (const sd of sides) {
                 totalPx += edgeContribPx(s, sd.key, sd.x1, sd.y1, sd.x2, sd.y2, edgeType);
+            }
+            // U-shape radius arcs (best-effort: rendered as polygon corners currently)
+            const poly = uShapePolygon(s);
+            for (let i = 0; i < poly.length; i++) {
+                const rad = (s.corners && s.corners[`uc${i}`]) || 0;
+                if (rad > 0 && s.cornerEdges?.[`uc${i}`]?.type === edgeType) {
+                    totalPx += Math.PI / 2 * rad;
+                }
             }
         } else if (s.shapeType === 'bsp') {
             const sides = bspSides(s);
@@ -4884,21 +5049,23 @@ function calcPageEdgeLinearFt(page, edgeType) {
 }
 
 function calcPageSinkCounts(page) {
-    let overmount = 0, undermount = 0, vasque = 0, cooktops = 0;
+    let overmount = 0, undermount = 0, vasque = 0, cooktops = 0, farmSinks = 0;
     for (const s of page.shapes) {
         if (s.subtype === 'sink_overmount') overmount++;
         else if (s.subtype === 'sink_undermount') undermount++;
         else if (s.subtype === 'sink_vasque') vasque++;
         else if (s.subtype === 'cooktop') cooktops++;
+        // Farmhouse sinks are a property on a countertop shape, not a separate subtype
+        if (!s.subtype && s.farmSink) farmSinks++;
     }
-    return { overmount, undermount, vasque, cooktops };
+    return { overmount, undermount, vasque, cooktops, farmSinks };
 }
 
 // ── Compute service quantities for the new rate model ────────
 // Returns { pencilLf, coupeSqft, dektonCoupeSqft, evierOver, evierUnder, evierVasque, fini45Lf, lamineLf, polissageSousQty }
 function calcServiceQtys() {
     let pencilLf = 0, coupeSqft = 0, dektonCoupeSqft = 0;
-    let evierOver = 0, evierUnder = 0, evierVasque = 0, cooktopQty = 0;
+    let evierOver = 0, evierUnder = 0, evierVasque = 0, cooktopQty = 0, farmSinkQty = 0;
     let fini45Lf = 0, lamineLf = 0;
     let totalSqft = 0;
     for (const page of pages) {
@@ -4914,6 +5081,7 @@ function calcServiceQtys() {
         evierUnder += sinks.undermount;
         evierVasque += sinks.vasque;
         cooktopQty += sinks.cooktops;
+        farmSinkQty += sinks.farmSinks;
         // Material area — split by Dekton vs non-Dekton
         for (const s of page.shapes) {
             if (s.subtype) continue;
@@ -4939,7 +5107,7 @@ function calcServiceQtys() {
     return {
         pencilLf, coupeSqft, dektonCoupeSqft,
         evierOver, evierUnder, evierVasque,
-        cooktopQty,
+        cooktopQty, farmSinkQty,
         fini45Lf, lamineLf,
         polissageSousQty: pricingData.polissageSousQty || 0,
         installationSqft: totalSqft,
@@ -4961,6 +5129,7 @@ function getServiceLineItems() {
             case 'evierUnder':    qty = q.evierUnder;        unitLabel = `${qty} trou(s)`; break;
             case 'evierVasque':   qty = q.evierVasque;       unitLabel = `${qty} trou(s)`; break;
             case 'cooktop':       qty = q.cooktopQty;        unitLabel = `${qty} trou(s)`; break;
+            case 'farmSink':      qty = q.farmSinkQty;       unitLabel = `${qty} évier(s)`; break;
             case 'fini45':        qty = q.fini45Lf;          unitLabel = `${qty.toFixed(2)} lin ft`; break;
             case 'lamine':        qty = q.lamineLf;          unitLabel = `${qty.toFixed(2)} lin ft`; break;
             case 'polissageSous': qty = q.polissageSousQty;  unitLabel = `× ${qty}`; break;
@@ -5077,8 +5246,11 @@ function renderPricingPanel() {
     // ── Material costs (slab-based) ──────────────────────────
     let materialCostTotal = 0;
     let matLines = '';
-    const matSqftMap = {};
+    // Compute sqft per page (by page.id)
+    const pageSqftById = {};
+    let totalProjectSqft = 0;
     for (const page of pages) {
+        let pageSqft = 0;
         for (const s of page.shapes) {
             if (s.subtype) continue;
             let area = s.w * s.h;
@@ -5086,16 +5258,22 @@ function renderPricingPanel() {
             if (s.shapeType === 'u') area = uShapeAreaPx(s);
             if (s.shapeType === 'circle') area = Math.PI * (s.w/2) * (s.h/2);
             if (s.farmSink) area -= (FS_WIDTH_IN * INCH) * (FS_DEPTH_IN * INCH);
-            const mid = s.materialId || (formData.materials[0] && formData.materials[0].id) || 0;
-            matSqftMap[mid] = (matSqftMap[mid] || 0) + area / SQFT_PX2;
+            pageSqft += area / SQFT_PX2;
         }
+        pageSqftById[page.id] = pageSqft;
+        totalProjectSqft += pageSqft;
     }
-    // Total project sqft across all shapes (used for Option scenarios)
-    let totalProjectSqft = 0;
-    for (const v of Object.values(matSqftMap)) totalProjectSqft += v;
-    // Options ALWAYS cover the whole project — overwrite their per-shape sqft
+
+    // Build matSqftMap by material type:
+    //   - Page-type material: sqft = sqft of its linked page
+    //   - Option-type material: sqft = whole-project total (alternative scenarios)
+    const matSqftMap = {};
     for (const mat of (formData.materials||[])) {
-        if ((mat.type||'zone') === 'option') {
+        const t = mat.type || 'page';
+        if (t === 'page') {
+            const ps = (mat.pageId != null) ? (pageSqftById[mat.pageId] || 0) : 0;
+            matSqftMap[mat.id] = ps;
+        } else if (t === 'option') {
             matSqftMap[mat.id] = totalProjectSqft;
         }
     }
@@ -5142,40 +5320,35 @@ function renderPricingPanel() {
         return { mat, html, matSubtotal };
     }
 
-    // Group materials by type
-    const pagesGrp = [], zonesGrp = [], optionsGrp = [];
+    // Group materials by type (Page or Option — Zones have been removed)
+    const pagesGrp = [], optionsGrp = [];
     for (const [mid, msqft] of Object.entries(matSqftMap)) {
         const b = buildMatBlock(mid, msqft);
-        const t = (b.mat.type || 'zone');
-        if (t === 'page')        pagesGrp.push({ mid, ...b });
-        else if (t === 'option') optionsGrp.push({ mid, ...b });
-        else                     zonesGrp.push({ mid, ...b });
+        const t = (b.mat.type || 'page');
+        if (t === 'option') optionsGrp.push({ mid, ...b });
+        else                pagesGrp.push({ mid, ...b });  // default: page
     }
 
-    // ── Pages: each gets its own subtotal section ────────────
-    for (const b of pagesGrp) {
-        materialCostTotal += b.matSubtotal;
-        const name = b.mat.label || 'Page';
-        sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px;border:1px solid #5fb8c2;border-radius:6px;padding:8px;background:#1f1f1f">
-            <div class="price-check-label" style="color:#5fb8c2">PAGE — ${name}</div>
-            ${b.html}
-            <div style="text-align:right;margin-top:6px;font-size:12px;font-weight:700;color:#5fb8c2">Page subtotal: ${fmt$(b.matSubtotal)}</div>
+    // Warn about canvas pages that have shapes but no linked Page-type material
+    const linkedPageIds = new Set(pagesGrp.map(b => b.mat.pageId).filter(Boolean));
+    const orphanPages = pages.filter(p => (pageSqftById[p.id] || 0) > 0 && !linkedPageIds.has(p.id));
+    if (orphanPages.length > 0) {
+        sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px;border:1px dashed #e0a050;border-radius:6px;padding:8px;background:#1f1b10">
+            <div style="color:#e0a050;font-size:11px;font-weight:700;margin-bottom:3px">⚠ Page(s) without a linked material</div>
+            <div style="color:#aaa;font-size:10px">These canvas pages have shapes but no Page-type material assigned: ${orphanPages.map(p=>p.name).join(', ')}. Add a material of type "Page" and link it to each page to include them in pricing.</div>
         </div>`;
     }
 
-    // ── Zones: combined section ──────────────────────────────
-    if (zonesGrp.length > 0) {
-        let zoneTotal = 0, zoneInner = '';
-        for (const b of zonesGrp) {
-            zoneTotal += b.matSubtotal;
-            const zoneLbl = (b.mat.label||'').trim();
-            zoneInner += (zoneLbl ? `<div style="font-size:10px;color:#5fb8c2;margin:4px 0 2px;padding-left:2px">Zone: ${zoneLbl}</div>` : '') + b.html;
-        }
-        materialCostTotal += zoneTotal;
-        sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px">
-            <div class="price-check-label">${zonesGrp.length > 1 ? 'Zones' : 'Material'}</div>
-            ${zoneInner}
-            ${zonesGrp.length > 1 ? `<div style="text-align:right;margin-top:4px;font-size:12px;font-weight:700;color:#5fb8c2">Zones total: ${fmt$(zoneTotal)}</div>` : ''}
+    // ── Pages: each Page-material gets its own subtotal section ────
+    for (const b of pagesGrp) {
+        materialCostTotal += b.matSubtotal;
+        const linkedPage = pages.find(p => p.id === b.mat.pageId);
+        const name = linkedPage ? linkedPage.name : (b.mat.label || 'Unassigned');
+        const unassignedNote = linkedPage ? '' : ' <span style="font-size:9px;color:#e0a050">(not linked to any page)</span>';
+        sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px;border:1px solid #5fb8c2;border-radius:6px;padding:8px;background:#1f1f1f">
+            <div class="price-check-label" style="color:#5fb8c2">PAGE — ${name}${unassignedNote}</div>
+            ${b.html}
+            <div style="text-align:right;margin-top:6px;font-size:12px;font-weight:700;color:#5fb8c2">Page subtotal: ${fmt$(b.matSubtotal)}</div>
         </div>`;
     }
 
@@ -5261,7 +5434,7 @@ function renderPricingPanel() {
         </div>
     </div>`;
 
-    // ── Grand total of committed costs (pages + zones + services) ──
+    // ── Grand total of committed costs (pages + services) ──
     const committedTotal = materialCostTotal + serviceCostTotal;
     const committedLabel = optionsGrp.length > 0 ? 'Committed subtotal (shared)' : 'Grand Total';
     sumHtml += `<div class="room-pricing-section" style="margin-top:8px;padding:8px;background:#3d5a68;border:1px solid #5fb8c2;border-radius:6px">
@@ -6729,19 +6902,27 @@ function calcPageEdgeFootage(page) {
             for (const sd of sides) {
                 addEdge(s.edges?.[sd.key], Math.hypot(sd.x2-sd.x1, sd.y2-sd.y1));
             }
-            // chamfer diagonals
+            // L-shape per-vertex treatments (chamfer diagonals OR radius arcs)
             const verts = lShapeVerts(s);
             for (let i = 0; i < verts.length; i++) {
                 const nv = verts[i];
                 if (nv.t > 0 && nv.r === 0) {
                     const dk = `diag_lc${i}`;
                     addSeg(s.chamferEdges?.[dk]?.type, Math.hypot(nv.pout[0]-nv.pin[0], nv.pout[1]-nv.pin[1]));
+                } else if (nv.r > 0) {
+                    addSeg(s.cornerEdges?.[`lc${i}`]?.type, Math.PI / 2 * nv.r);
                 }
             }
         } else if (s.shapeType === 'u') {
             const sides = uShapeSides(s);
             for (const sd of sides) {
                 addEdge(s.edges?.[sd.key], Math.hypot(sd.x2-sd.x1, sd.y2-sd.y1));
+            }
+            // U-shape radius arcs (best-effort)
+            const poly = uShapePolygon(s);
+            for (let i = 0; i < poly.length; i++) {
+                const rad = (s.corners && s.corners[`uc${i}`]) || 0;
+                if (rad > 0) addSeg(s.cornerEdges?.[`uc${i}`]?.type, Math.PI / 2 * rad);
             }
         } else if (s.shapeType === 'bsp') {
             const sides = bspSides(s);
@@ -6789,50 +6970,107 @@ function calcPageEdgeFootage(page) {
     return result;
 }
 
+// Per-page pricing breakdown (material + per-page services + subtotal)
+function calcPagePricing(page) {
+    const roomSqft = calcPageSqft(page);
+    const pageMat = (formData.materials||[]).find(m =>
+        (m.type||'page') === 'page' && m.pageId === page.id
+    );
+
+    // Material + cutting (per-material cutting rate, Dekton vs regular)
+    let matCost = 0, cutCost = 0, cutRate = 0;
+    let isDekton = false;
+    if (pageMat && roomSqft > 0) {
+        isDekton = (pageMat.supplier||'').toLowerCase().includes('dekton')
+                || (pageMat.color   ||'').toLowerCase().includes('dekton')
+                || (pageMat.thickness||'').toLowerCase().includes('dekton');
+        matCost = roomSqft * getMatPriceSqft(pageMat.id);
+        cutRate = isDekton ? (pricingData.rates.dektonCoupe||0) : (pricingData.rates.coupe||0);
+        cutCost = roomSqft * cutRate;
+    }
+
+    // Edge services: pencil+polished → pencil rate, waterfall → fini45, mitered → lamine
+    const edgeFootage = calcPageEdgeFootage(page);
+    const pencilLf = (edgeFootage.pencil || 0) + (edgeFootage.polished || 0);
+    const fini45Lf = edgeFootage.waterfall || 0;
+    const lamineLf = edgeFootage.mitered || 0;
+    const pencilCost = pencilLf * (pricingData.rates.pencil || 0);
+    const fini45Cost = fini45Lf * (pricingData.rates.fini45 || 0);
+    const lamineCost = lamineLf * (pricingData.rates.lamine || 0);
+
+    // Sink + cooktop holes
+    const sinks = calcPageSinkCounts(page);
+    const evierOverCost   = sinks.overmount  * (pricingData.rates.evierOver   || 0);
+    const evierUnderCost  = sinks.undermount * (pricingData.rates.evierUnder  || 0);
+    const evierVasqueCost = sinks.vasque     * (pricingData.rates.evierVasque || 0);
+    const cooktopCost     = sinks.cooktops   * (pricingData.rates.cooktop     || 0);
+    const farmSinkCost    = sinks.farmSinks  * (pricingData.rates.farmSink    || 0);
+
+    const servicesCost  = pencilCost + fini45Cost + lamineCost + evierOverCost + evierUnderCost + evierVasqueCost + cooktopCost + farmSinkCost;
+    const pageSubtotal  = matCost + cutCost + servicesCost;
+
+    return {
+        page, pageMat, roomSqft, isDekton,
+        matCost, cutCost, cutRate,
+        edgeFootage, pencilLf, fini45Lf, lamineLf, pencilCost, fini45Cost, lamineCost,
+        sinks, evierOverCost, evierUnderCost, evierVasqueCost, cooktopCost, farmSinkCost,
+        servicesCost, pageSubtotal
+    };
+}
+
+// Project-wide fees applied once (not attributable to a single page)
+function calcProjectFees() {
+    let totalSqft = 0;
+    for (const page of pages) totalSqft += calcPageSqft(page);
+    const installRate = pricingData.rates.installation || 0;
+    const installMin  = pricingData.installationMin   || 0;
+    const installRaw  = totalSqft * installRate;
+    const installCost = Math.max(installRaw, installMin);
+    const installMinApplied = installMin > 0 && installRaw < installMin;
+    const measEnabled = pricingData.measurementsEnabled !== false;
+    const measCost    = measEnabled ? (pricingData.rates.measurements || 0) : 0;
+    const polQty      = pricingData.polissageSousQty || 0;
+    const polCost     = polQty * (pricingData.rates.polissageSous || 0);
+    return {
+        totalSqft,
+        installRate, installMin, installRaw, installCost, installMinApplied,
+        measEnabled, measCost,
+        polQty, polCost,
+        total: installCost + measCost + polCost
+    };
+}
+
 function calcRoomPricing(page) {
     const TAX      = 1.14975; // 1 + GST(5%) + QST(9.975%)
     const roomSqft = calcPageSqft(page);
 
-    const matSqftMap = {};
-    for (const s of page.shapes) {
-        if (s.subtype) continue;
-        let area = s.w * s.h;
-        if (s.shapeType === 'l') area -= (s.notchW||0) * (s.notchH||0);
-        if (s.shapeType === 'u') area = uShapeAreaPx(s);
-        if (s.shapeType === 'circle') area = Math.PI * (s.w / 2) * (s.h / 2);
-                if (s.farmSink) area -= (FS_WIDTH_IN * INCH) * (FS_DEPTH_IN * INCH);
-        const mid = s.materialId || (formData.materials[0] && formData.materials[0].id) || 0;
-        matSqftMap[mid] = (matSqftMap[mid] || 0) + area / SQFT_PX2;
-    }
+    // Find the Page-type material linked to THIS canvas page (by pageId)
+    const pageMat = (formData.materials||[]).find(m =>
+        (m.type||'page') === 'page' && m.pageId === page.id
+    );
 
     const matEntries = [];
     let materialCostTotal = 0;
-    for (const [mid, msqft] of Object.entries(matSqftMap)) {
-        const mat = formData.materials.find(m => m.id === +mid) || {};
-        const mtype = mat.type || 'zone';
-        // Skip Options — they are rendered in the final project summary, not per-page
-        if (mtype === 'option') continue;
-        const mlabel = mat.label || '';
-        const isDekton = (mat.supplier||'').toLowerCase().includes('dekton') ||
-                         (mat.color||'').toLowerCase().includes('dekton') ||
-                         (mat.thickness||'').toLowerCase().includes('dekton') ||
-                         (mat.notes||'').toLowerCase().includes('dekton');
-        const pps = getMatPriceSqft(+mid);
-        const matCost = msqft * pps;
-        // Attribute cutting fee directly to the material based on its type
+    if (pageMat && roomSqft > 0) {
+        const isDekton = (pageMat.supplier||'').toLowerCase().includes('dekton') ||
+                         (pageMat.color||'').toLowerCase().includes('dekton') ||
+                         (pageMat.thickness||'').toLowerCase().includes('dekton') ||
+                         (pageMat.notes||'').toLowerCase().includes('dekton');
+        const pps = getMatPriceSqft(pageMat.id);
+        const matCost = roomSqft * pps;
         const cuttingRate = isDekton ? (pricingData.rates.dektonCoupe || 0) : (pricingData.rates.coupe || 0);
-        const cuttingCost = msqft * cuttingRate;
+        const cuttingCost = roomSqft * cuttingRate;
         const entryPreT = matCost + cuttingCost;
-        materialCostTotal += entryPreT;
+        materialCostTotal = entryPreT;
         matEntries.push({
-            color:     mat.color     || '',
-            supplier:  mat.supplier  || '',
-            thickness: mat.thickness || '',
-            finish:    mat.finish    || '',
+            color:     pageMat.color     || '',
+            supplier:  pageMat.supplier  || '',
+            thickness: pageMat.thickness || '',
+            finish:    pageMat.finish    || '',
             preT:      entryPreT,
             isDekton,
-            mtype,
-            mlabel
+            mtype:     'page',
+            mlabel:    page.name
         });
     }
 
@@ -6840,7 +7078,7 @@ function calcRoomPricing(page) {
     const serviceItems = getServiceLineItems().filter(i => i.key !== 'coupe' && i.key !== 'dektonCoupe');
     const totalAddons = serviceItems.reduce((s, i) => s + i.cost, 0);
 
-    // Blend addons proportionally into page/zone entries
+    // Blend addons proportionally (only one entry here, but keep logic for fallback)
     for (const m of matEntries) {
         const share = materialCostTotal > 0
             ? (m.preT / materialCostTotal) * totalAddons
@@ -6848,12 +7086,12 @@ function calcRoomPricing(page) {
         m.blendedPreT = m.preT + share;
         m.total = m.blendedPreT * TAX;
     }
-    // If no materials but there are addons, create a single entry
+    // If the page has no linked material but still has services, create a single entry
     if (matEntries.length === 0 && totalAddons > 0) {
         matEntries.push({
             color:'Services', supplier:'', thickness:'', finish:'',
             preT: 0, blendedPreT: totalAddons, total: totalAddons * TAX,
-            mtype: 'zone', mlabel: ''
+            mtype: 'page', mlabel: page.name
         });
     }
 
@@ -6882,31 +7120,24 @@ function calcOptionsSummary() {
     const serviceItems = getServiceLineItems().filter(i => i.key !== 'coupe' && i.key !== 'dektonCoupe');
     const sharedServices = serviceItems.reduce((s, i) => s + i.cost, 0);
 
-    // Shared committed material cost (zone/page materials — these apply to every Option scenario)
+    // Shared committed material cost — Page-type materials are added to every Option scenario
     let sharedCommittedMat = 0;
-    const committedMatsSqft = {};
+    // Page-type materials are "fixed" baselines added to each Option scenario:
+    // each linked page contributes (page sqft × $/sqft) + cutting to the shared baseline.
     for (const page of pages) {
-        for (const s of page.shapes) {
-            if (s.subtype) continue;
-            const mat = formData.materials.find(mm => mm.id === s.materialId);
-            if (!mat || (mat.type||'zone') === 'option') continue;
-            let area = s.w * s.h;
-            if (s.shapeType === 'l')      area -= (s.notchW||0) * (s.notchH||0);
-            if (s.shapeType === 'u')      area  = uShapeAreaPx(s);
-            if (s.shapeType === 'circle') area  = Math.PI * (s.w/2) * (s.h/2);
-            if (s.farmSink)               area -= (FS_WIDTH_IN * INCH) * (FS_DEPTH_IN * INCH);
-            committedMatsSqft[mat.id] = (committedMatsSqft[mat.id]||0) + area / SQFT_PX2;
-        }
-    }
-    for (const [mid, msqft] of Object.entries(committedMatsSqft)) {
-        const mat = formData.materials.find(mm => mm.id === +mid) || {};
-        const isDekton = (mat.supplier||'').toLowerCase().includes('dekton') ||
-                         (mat.color||'').toLowerCase().includes('dekton') ||
-                         (mat.thickness||'').toLowerCase().includes('dekton');
-        const pps = getMatPriceSqft(+mid);
-        const matCost = msqft * pps;
+        const pageMat = (formData.materials||[]).find(mm =>
+            (mm.type||'page') === 'page' && mm.pageId === page.id
+        );
+        if (!pageMat) continue;
+        const pSqft = calcPageSqft(page);
+        if (pSqft <= 0) continue;
+        const isDekton = (pageMat.supplier||'').toLowerCase().includes('dekton') ||
+                         (pageMat.color||'').toLowerCase().includes('dekton') ||
+                         (pageMat.thickness||'').toLowerCase().includes('dekton');
+        const pps = getMatPriceSqft(pageMat.id);
+        const matCost = pSqft * pps;
         const cutRate = isDekton ? (pricingData.rates.dektonCoupe||0) : (pricingData.rates.coupe||0);
-        sharedCommittedMat += matCost + msqft * cutRate;
+        sharedCommittedMat += matCost + pSqft * cutRate;
     }
 
     const sharedBaseline = sharedServices + sharedCommittedMat;
@@ -6914,7 +7145,7 @@ function calcOptionsSummary() {
     // Per-option breakdowns
     const options = [];
     for (const mat of (formData.materials||[])) {
-        if ((mat.type||'zone') !== 'option') continue;
+        if ((mat.type||'page') !== 'option') continue;
         const label = mat.label || `Option ${getOptionLetter(mat)}`;
         const isDekton = (mat.supplier||'').toLowerCase().includes('dekton') ||
                          (mat.color||'').toLowerCase().includes('dekton') ||
@@ -7020,36 +7251,72 @@ function generateProposal() {
     doc.text(`Valid until: ${validUntil}`, PW-MR, 65, {align:'right'});
     addPageFooter();
 
-    // Bill To banner
-    doc.setFillColor(...TBL_BG); doc.rect(ML, y, CW, 46, 'F');
-    doc.setDrawColor(...ACCENT); doc.setLineWidth(0.5); doc.rect(ML, y, CW, 46, 'S');
+    // Bill To banner — full client info (client + job + address + phones)
+    const phones = (formData.phones || []).filter(Boolean);
+    const addrLines = formData.address ? doc.splitTextToSize(formData.address, CW/2 - 14) : [];
+    const leftLines = 1 /*client*/ + (formData.job ? 1 : 0) + addrLines.length;
+    const rightLines = phones.length;
+    const bodyLines = Math.max(leftLines, rightLines);
+    const billH = 20 /*header band*/ + bodyLines * 12 + 10 /*padding*/;
+
+    doc.setFillColor(...TBL_BG); doc.rect(ML, y, CW, billH, 'F');
+    doc.setDrawColor(...ACCENT); doc.setLineWidth(0.5); doc.rect(ML, y, CW, billH, 'S');
+    // Vertical divider between left (Bill To) and right (Phone) columns
+    doc.setDrawColor(...ACCENT); doc.setLineWidth(0.3);
+    doc.line(ML + CW/2, y + 4, ML + CW/2, y + billH - 4);
+
+    // Left column — FACTURÉ À
     doc.setFont('helvetica','bold'); doc.setFontSize(7.5); doc.setTextColor(...BRAND);
     doc.text('FACTURÉ À', ML+6, y+11);
     doc.setFont('helvetica','italic'); doc.setFontSize(6); doc.setTextColor(120,100,50);
     doc.text('Bill to', ML+54, y+11);
-    doc.setFont('helvetica','bold'); doc.setFontSize(13); doc.setTextColor(...BODY_T);
-    doc.text(formData.client || '—', ML+6, y+26);
-    doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(80,68,30);
-    doc.text(formData.job || '', ML+6, y+38);
-    y += 56;
+    let ly = y + 26;
+    doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(...BODY_T);
+    doc.text(formData.client || '—', ML+6, ly); ly += 14;
+    if (formData.job) {
+        doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(80,68,30);
+        doc.text(formData.job, ML+6, ly); ly += 11;
+    }
+    if (addrLines.length > 0) {
+        doc.setFont('helvetica','normal'); doc.setFontSize(8.5); doc.setTextColor(80,68,30);
+        for (const l of addrLines) { doc.text(l, ML+6, ly); ly += 10; }
+    }
 
-    // Layout drawings — each with a cost panel on the right
-    const PANEL_W = 148; // width of right-side cost panel
+    // Right column — TÉLÉPHONE
+    if (phones.length > 0) {
+        doc.setFont('helvetica','bold'); doc.setFontSize(7.5); doc.setTextColor(...BRAND);
+        doc.text('TÉLÉPHONE', ML + CW/2 + 8, y+11);
+        doc.setFont('helvetica','italic'); doc.setFontSize(6); doc.setTextColor(120,100,50);
+        doc.text('Phone', ML + CW/2 + 60, y+11);
+        doc.setFont('helvetica','normal'); doc.setFontSize(10); doc.setTextColor(...BODY_T);
+        let py = y + 28;
+        for (const ph of phones) { doc.text(ph, ML + CW/2 + 8, py); py += 12; }
+    }
+
+    y += billH + 12;
+
+    // Layout drawings — each page gets its own pricing panel (material + services + subtotal)
+    const PANEL_W = 190;
     const savedIdx = currentPageIdx;
-    dimSizeMultiplier = 1.5; // 50% bigger dim numbers in proposal PDF
-    // Estimate cost panel content height
-    function panelContentH(matEntries, edgeFootage) {
+    dimSizeMultiplier = 1.5;
+    // Estimate panel content height (material header + edges + services + subtotal)
+    function panelContentH(pp) {
         let h = 27; // room name header + separator
-        h += 10 + 8; // sqft row + edge header
-        h += Object.keys(edgeFootage).length * 9; // one row per edge type
-        h += 6; // separator after metrics
-        for (const m of matEntries) {
-            h += 12; // color bar
-            const det = [m.supplier, m.thickness, m.finish].filter(Boolean).join('');
-            if (det) h += 9; // details line
-            h += 14 + 16 + 6; // before-tax block (14) + after-tax block (16) + separator (6)
-        }
-        h += 16; // bottom padding
+        if (pp.pageMat) h += 11 + 9 + 6; // material name + details + spacer
+        h += 10; // sqft
+        const edgeTypes = Object.keys(pp.edgeFootage);
+        if (edgeTypes.length > 0) h += 8 + edgeTypes.length * 9 + 7;
+        // Service rows
+        let nServiceLines = 0;
+        if (pp.sinks.overmount  > 0) nServiceLines++;
+        if (pp.sinks.undermount > 0) nServiceLines++;
+        if (pp.sinks.vasque     > 0) nServiceLines++;
+        if (pp.sinks.cooktops   > 0) nServiceLines++;
+        if (nServiceLines > 0) h += 8 + nServiceLines * 9 + 7;
+        // Price breakdown
+        if (pp.pageMat) h += 8 + 10 + 10 + 6; // header + mat line + cut line + sep
+        if (pp.servicesCost > 0) h += 10; // services line
+        h += 24; // page subtotal box
         return h;
     }
 
@@ -7088,14 +7355,18 @@ function generateProposal() {
     selected = null; selectedDiag = null; selectedText = null; selectedJoint = null;
     hovCorner = null; hovEdge = null;
 
+    // Collect per-page pricing for the final summary
+    const pagePricings = [];
+
     for (let pi=0; pi<pages.length; pi++) {
         const page = pages[pi];
         currentPageIdx = pi; syncPageIn(); render();
 
         const { dataURL: imgData, w: natW, h: natH } = croppedCanvasData(page);
-        const { roomSqft, matEntries, roomTotal } = calcRoomPricing(page);
-        const edgeFootage = calcPageEdgeFootage(page);
-        const contentH = panelContentH(matEntries, edgeFootage);
+        const pp = calcPagePricing(page);
+        pagePricings.push(pp);
+        const { roomSqft, pageMat, edgeFootage, sinks } = pp;
+        const contentH = panelContentH(pp);
 
         // Fixed zones: image always left 364pt, panel always right 148pt
         const IMG_ZONE_W = CW - PANEL_W - 10; // 364pt
@@ -7139,24 +7410,37 @@ function generateProposal() {
         doc.setDrawColor(...ACCENT); doc.setLineWidth(0.4);
         doc.line(px+5, py2, px+pw-5, py2); py2 += 9;
 
+        // ── Material for this page ──
+        if (pageMat) {
+            doc.setFont('helvetica','bold'); doc.setFontSize(8); doc.setTextColor(...BODY_T);
+            doc.text(doc.splitTextToSize(pageMat.color || 'Matériau', pw-10)[0], px+5, py2);
+            py2 += 9;
+            const matDet = [pageMat.supplier, pageMat.thickness, pageMat.finish].filter(Boolean).join(' • ');
+            if (matDet) {
+                doc.setFont('helvetica','normal'); doc.setFontSize(6.5); doc.setTextColor(100,85,40);
+                doc.text(doc.splitTextToSize(matDet, pw-10)[0], px+5, py2);
+                py2 += 8;
+            }
+            py2 += 4;
+        }
+
         // ── Square footage ──
         doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(80,68,30);
         doc.text('Superficie / Area :', px+5, py2);
         doc.setFont('helvetica','bold'); doc.setFontSize(7.5); doc.setTextColor(...BODY_T);
-        doc.text(`${roomSqft.toFixed(2)} pi²  /  ft²`, px+pw-5, py2, {align:'right'});
+        doc.text(`${roomSqft.toFixed(2)} pi² / ft²`, px+pw-5, py2, {align:'right'});
         py2 += 10;
 
         // ── Edge footage by profile ──
         const edgeTypes = Object.keys(edgeFootage);
         if (edgeTypes.length > 0) {
             doc.setFont('helvetica','bold'); doc.setFontSize(6.5); doc.setTextColor(...BRAND);
-            doc.text('PROFILS — PIEDS LINÉAIRES / LINEAR FEET', px+5, py2);
+            doc.text('PROFILS — PIEDS LINÉAIRES', px+5, py2);
             py2 += 8;
             for (const etype of edgeTypes) {
                 const def = EDGE_DEFS[etype];
                 if (!def) continue;
                 const lf = edgeFootage[etype].toFixed(2);
-                // coloured abbr tag
                 const [er,eg,eb] = hexToRgb(def.color);
                 doc.setFillColor(er,eg,eb);
                 doc.roundedRect(px+5, py2-5, 14, 7, 1, 1, 'F');
@@ -7165,56 +7449,64 @@ function generateProposal() {
                 doc.setFont('helvetica','normal'); doc.setFontSize(6.5); doc.setTextColor(60,50,20);
                 doc.text(def.label, px+22, py2);
                 doc.setFont('helvetica','bold'); doc.setFontSize(6.5); doc.setTextColor(...BODY_T);
-                doc.text(`${lf} pi/ft`, px+pw-5, py2, {align:'right'});
+                doc.text(`${lf} pi`, px+pw-5, py2, {align:'right'});
                 py2 += 9;
             }
-        }
-
-        doc.setDrawColor(200,185,140); doc.setLineWidth(0.3);
-        doc.line(px+5, py2, px+pw-5, py2); py2 += 7;
-
-        // One block per material
-        for (const m of matEntries) {
-            // Build type tag for display
-            let tag = '';
-            if (m.mtype === 'option') tag = `[${m.mlabel || 'Option'}] `;
-            else if (m.mtype === 'page' && m.mlabel) tag = `[Page: ${m.mlabel}] `;
-            else if (m.mtype === 'zone' && m.mlabel) tag = `[${m.mlabel}] `;
-            const displayName = tag + (m.color || 'Matériau');
-            // Color name bar — highlight options in accent
-            if (m.mtype === 'option') doc.setFillColor(...ACCENT);
-            else doc.setFillColor(...BRAND);
-            doc.rect(px+3, py2-8, pw-6, 12, 'F');
-            doc.setFont('helvetica','bold'); doc.setFontSize(7.5);
-            if (m.mtype === 'option') doc.setTextColor(...BODY_T);
-            else doc.setTextColor(255,255,255);
-            doc.text(doc.splitTextToSize(displayName, pw-14)[0], px+6, py2);
-            py2 += 11;
-            // Details
-            const det = [m.supplier, m.thickness, m.finish].filter(Boolean).join('  |  ');
-            if (det) {
-                doc.setFont('helvetica','normal'); doc.setFontSize(6.5); doc.setTextColor(100,85,40);
-                for (const l of doc.splitTextToSize(det, pw-10)) { doc.text(l, px+5, py2); py2 += 8; }
-            }
-            // Pre-tax — French bold, English italic
-            doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(80,68,30);
-            doc.text('Avant taxes :', px+5, py2);
-            doc.setFont('helvetica','italic'); doc.setFontSize(6); doc.setTextColor(130,110,55);
-            doc.text('before tax', px+5, py2+7);
-            doc.setFont('helvetica','bold'); doc.setFontSize(7.5); doc.setTextColor(...BODY_T);
-            doc.text(fmt$(m.blendedPreT), px+pw-5, py2+3, {align:'right'});
-            py2 += 14;
-            // After-tax — French bold, English italic
-            doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(80,68,30);
-            doc.text('Taxes incluses :', px+5, py2);
-            doc.setFont('helvetica','italic'); doc.setFontSize(6); doc.setTextColor(130,110,55);
-            doc.text('with taxes', px+5, py2+7);
-            doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BRAND);
-            doc.text(fmt$(m.total), px+pw-5, py2+3, {align:'right'});
-            py2 += 16;
             doc.setDrawColor(200,185,140); doc.setLineWidth(0.3);
-            doc.line(px+5, py2, px+pw-5, py2); py2 += 6;
+            doc.line(px+5, py2, px+pw-5, py2); py2 += 7;
         }
+
+        // ── Sink / cooktop services (counts) ──
+        const serviceRows = [];
+        if (sinks.overmount  > 0) serviceRows.push(['Évier overmount',  sinks.overmount]);
+        if (sinks.undermount > 0) serviceRows.push(['Évier undermount', sinks.undermount]);
+        if (sinks.vasque     > 0) serviceRows.push(['Évier vasque',     sinks.vasque]);
+        if (sinks.cooktops   > 0) serviceRows.push(['Cooktop',          sinks.cooktops]);
+        if (sinks.farmSinks  > 0) serviceRows.push(['Farmhouse sink',   sinks.farmSinks]);
+        if (serviceRows.length > 0) {
+            doc.setFont('helvetica','bold'); doc.setFontSize(6.5); doc.setTextColor(...BRAND);
+            doc.text('SERVICES', px+5, py2);
+            py2 += 8;
+            for (const [k, q] of serviceRows) {
+                doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(60,50,20);
+                doc.text(k, px+5, py2);
+                doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BODY_T);
+                doc.text(`× ${q}`, px+pw-5, py2, {align:'right'});
+                py2 += 9;
+            }
+            doc.setDrawColor(200,185,140); doc.setLineWidth(0.3);
+            doc.line(px+5, py2, px+pw-5, py2); py2 += 7;
+        }
+
+        // ── Price breakdown ──
+        if (pageMat) {
+            doc.setFont('helvetica','bold'); doc.setFontSize(6.5); doc.setTextColor(...BRAND);
+            doc.text('PRIX / PRICE', px+5, py2);
+            py2 += 8;
+            doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(60,50,20);
+            doc.text('Matériel + découpe', px+5, py2);
+            doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BODY_T);
+            doc.text(fmt$(pp.matCost + pp.cutCost), px+pw-5, py2, {align:'right'});
+            py2 += 10;
+        }
+        if (pp.servicesCost > 0) {
+            doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(60,50,20);
+            doc.text('Services', px+5, py2);
+            doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BODY_T);
+            doc.text(fmt$(pp.servicesCost), px+pw-5, py2, {align:'right'});
+            py2 += 10;
+        }
+
+        // ── Page subtotal box (highlighted) ──
+        doc.setFillColor(...ACCENT);
+        doc.rect(px+3, py2, pw-6, 20, 'F');
+        doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BRAND);
+        doc.text('SOUS-TOTAL', px+7, py2+9);
+        doc.setFont('helvetica','italic'); doc.setFontSize(5.5); doc.setTextColor(...BRAND);
+        doc.text('subtotal (before tax)', px+7, py2+16);
+        doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...BRAND);
+        doc.text(fmt$(pp.pageSubtotal), px+pw-7, py2+14, {align:'right'});
+        py2 += 24;
 
         y += panelH + 16;
     }
@@ -7224,107 +7516,200 @@ function generateProposal() {
     selectedJoint = _pSavedJoint; hovCorner = _pSavedHovC; hovEdge = _pSavedHovE;
     syncPageIn(); render();
 
+    // ── PROJECT SUMMARY — sums per-page subtotals + project-level fees ──
+    // Skipped when Options exist (the options section below supplies full scenario totals).
+    const __preOptsum = calcOptionsSummary();
+    const hasOptions = __preOptsum.options.length > 0;
+    if (!hasOptions && pagePricings.length > 0) {
+        const TAX = 1.14975;
+        const fees = calcProjectFees();
+        const pagesSubtotal = pagePricings.reduce((s, pp) => s + pp.pageSubtotal, 0);
+        const preT = pagesSubtotal + fees.total;
+        const withTax = preT * TAX;
+
+        // Room for the summary block (force new page if needed)
+        const needH = 60 + pagePricings.length * 14 + 14 * 4 + 30;
+        if (y + needH > PH - FOOTER_H - 10) newPdfPage();
+
+        sectionHead('SOMMAIRE DU PROJET / PROJECT SUMMARY');
+
+        // Per-page rows
+        doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
+        for (const pp of pagePricings) {
+            checkY(13);
+            doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
+            doc.text(pp.page.name, ML + 6, y);
+            const matText = pp.pageMat ? (pp.pageMat.color || '') : '(no material)';
+            doc.setFont('helvetica','italic'); doc.setFontSize(7.5); doc.setTextColor(120,100,50);
+            doc.text(matText, ML + 110, y);
+            doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
+            doc.text(fmt$(pp.pageSubtotal), PW - MR - 6, y, {align:'right'});
+            y += 13;
+        }
+
+        // Page subtotal divider
+        y += 2;
+        doc.setDrawColor(...ACCENT); doc.setLineWidth(0.4);
+        doc.line(ML, y, PW - MR, y);
+        y += 11;
+        doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(80,68,30);
+        doc.text('Sous-total des pages / Pages subtotal', ML + 6, y);
+        doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...BODY_T);
+        doc.text(fmt$(pagesSubtotal), PW - MR - 6, y, {align:'right'});
+        y += 16;
+
+        // Project-level fees
+        if (fees.installCost > 0 || fees.measCost > 0 || fees.polCost > 0) {
+            doc.setFont('helvetica','bold'); doc.setFontSize(8); doc.setTextColor(...BRAND);
+            doc.text('FRAIS DE PROJET / PROJECT FEES', ML + 6, y);
+            y += 11;
+            doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
+            if (fees.installCost > 0) {
+                checkY(13);
+                const lbl = fees.installMinApplied
+                    ? `Installation (${fees.totalSqft.toFixed(1)} sqft — minimum applied)`
+                    : `Installation (${fees.totalSqft.toFixed(1)} sqft × ${fmt$(fees.installRate)})`;
+                doc.text(lbl, ML + 6, y);
+                doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
+                doc.text(fmt$(fees.installCost), PW - MR - 6, y, {align:'right'});
+                doc.setFont('helvetica','normal');
+                y += 13;
+            }
+            if (fees.measCost > 0) {
+                checkY(13);
+                doc.text('Measurements (flat fee)', ML + 6, y);
+                doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
+                doc.text(fmt$(fees.measCost), PW - MR - 6, y, {align:'right'});
+                doc.setFont('helvetica','normal');
+                y += 13;
+            }
+            if (fees.polCost > 0) {
+                checkY(13);
+                doc.text(`Polissage sous morceau × ${fees.polQty}`, ML + 6, y);
+                doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
+                doc.text(fmt$(fees.polCost), PW - MR - 6, y, {align:'right'});
+                doc.setFont('helvetica','normal');
+                y += 13;
+            }
+            y += 2;
+            doc.setDrawColor(...ACCENT); doc.setLineWidth(0.4);
+            doc.line(ML, y, PW - MR, y);
+            y += 11;
+        }
+
+        // Pre-tax total
+        checkY(20);
+        doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(80,68,30);
+        doc.text('Total avant taxes / Subtotal before tax', ML + 6, y);
+        doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(...BODY_T);
+        doc.text(fmt$(preT), PW - MR - 6, y, {align:'right'});
+        y += 16;
+
+        // Grand total with tax (highlighted)
+        checkY(36);
+        doc.setFillColor(...ACCENT);
+        doc.rect(ML, y, CW, 32, 'F');
+        doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(...BRAND);
+        doc.text('GRAND TOTAL', ML + 10, y + 14);
+        doc.setFont('helvetica','italic'); doc.setFontSize(8); doc.setTextColor(...BRAND);
+        doc.text('taxes incluses / with taxes (GST 5% + QST 9.975%)', ML + 10, y + 24);
+        doc.setFont('helvetica','bold'); doc.setFontSize(16); doc.setTextColor(...BRAND);
+        doc.text(fmt$(withTax), PW - MR - 10, y + 22, {align:'right'});
+        y += 40;
+    }
+
     // ── OPTIONS SUMMARY — client selects one (forced to its own final page) ──
+    // Row-based layout: scales cleanly up to 5 options on a single page.
     const optsum = calcOptionsSummary();
     if (optsum.options.length > 0) {
         newPdfPage();
         y = 90;
         sectionHead('CLIENT OPTIONS — PLEASE SELECT ONE');
-        doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
+        doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...BODY_T);
         doc.text('Chaque option couvre l\'entièreté du projet.', ML, y, {maxWidth: CW});
-        y += 11;
+        y += 12;
         doc.setFont('helvetica','italic'); doc.setFontSize(8); doc.setTextColor(120,100,50);
         doc.text('Each option covers the entire project — please select one.', ML, y, {maxWidth: CW});
-        y += 18;
+        y += 20;
 
-        const n = optsum.options.length;
-        const gap = 10;
-        const cardW = Math.min((CW - gap * (n - 1)) / n, 175);
-        const totalW = cardW * n + gap * (n - 1);
-        const startX = ML + (CW - totalW) / 2;
-        const cardH = 230;
+        // Project summary line (shared across every option)
+        doc.setFillColor(...TBL_BG); doc.rect(ML, y, CW, 18, 'F');
+        doc.setDrawColor(...ACCENT); doc.setLineWidth(0.4); doc.rect(ML, y, CW, 18, 'S');
+        doc.setFont('helvetica','bold'); doc.setFontSize(8); doc.setTextColor(...BRAND);
+        doc.text(`Superficie totale / Total area:  ${optsum.totalSqft.toFixed(2)} pi² / ft²`, ML+8, y+12);
+        y += 26;
 
-        for (let i = 0; i < n; i++) {
+        const rowH   = 62;
+        const labelW = 64;
+        const totalW = 136;
+        const midX   = ML + labelW + 8;
+        const midW   = CW - labelW - totalW - 12;
+        const tx     = ML + CW - totalW;
+
+        for (let i = 0; i < optsum.options.length; i++) {
             const op = optsum.options[i];
-            const cx = startX + i * (cardW + gap);
+            // Page break guard
+            if (y + rowH > PH - FOOTER_H - 40) { newPdfPage(); y = 90; }
+
             const cy = y;
-
-            // Card background + border
+            // Row background + border
             doc.setFillColor(252, 250, 243);
-            doc.setDrawColor(...ACCENT);
-            doc.setLineWidth(0.8);
-            doc.roundedRect(cx, cy, cardW, cardH, 4, 4, 'FD');
+            doc.setDrawColor(...ACCENT); doc.setLineWidth(0.7);
+            doc.roundedRect(ML, cy, CW, rowH, 4, 4, 'FD');
 
-            // Header bar
+            // Left — option label column (brand color bar)
             doc.setFillColor(...BRAND);
-            doc.rect(cx, cy, cardW, 18, 'F');
-            doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(255,255,255);
-            doc.text(op.label, cx + cardW/2, cy + 12, { align: 'center' });
+            doc.roundedRect(ML, cy, labelW, rowH, 4, 4, 'F');
+            // Square off the right edge so it blends with the rest of the row
+            doc.rect(ML + labelW - 4, cy, 4, rowH, 'F');
+            doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(255,255,255);
+            doc.text(op.label, ML + labelW/2, cy + rowH/2 + 3, { align: 'center' });
 
-            // Material name + details
-            doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
-            doc.text(doc.splitTextToSize(op.color || 'Matériau', cardW - 10)[0], cx + 5, cy + 32);
+            // Middle — material info + breakdown
+            doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...BODY_T);
+            doc.text(doc.splitTextToSize(op.color || 'Matériau', midW)[0], midX, cy + 14);
             const det = [op.supplier, op.thickness, op.finish].filter(Boolean).join(' • ');
             if (det) {
-                doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(100,85,40);
-                doc.text(doc.splitTextToSize(det, cardW - 10)[0], cx + 5, cy + 42);
+                doc.setFont('helvetica','normal'); doc.setFontSize(7.5); doc.setTextColor(100,85,40);
+                doc.text(doc.splitTextToSize(det, midW)[0], midX, cy + 25);
             }
+            // Breakdown lines
+            doc.setFont('helvetica','normal'); doc.setFontSize(7.5); doc.setTextColor(80,68,30);
+            const bd1 = `Slabs: ${op.slabQty} × ${fmt$(op.pricePerSlab)} = ${fmt$(op.slabCost)}   ·   ${op.isDekton ? 'Dekton cut' : 'Découpe'}: ${fmt$(op.cuttingCost)}`;
+            doc.text(doc.splitTextToSize(bd1, midW)[0], midX, cy + 39);
+            let bd2 = `Services: ${fmt$(op.sharedServices)}`;
+            if (op.sharedCommittedMat > 0) bd2 += `   ·   Matériaux fixes: ${fmt$(op.sharedCommittedMat)}`;
+            doc.text(doc.splitTextToSize(bd2, midW)[0], midX, cy + 51);
 
-            // Breakdown rows
-            let by = cy + 60;
-            const lnH = 11;
-            doc.setFont('helvetica','normal'); doc.setFontSize(7.5); doc.setTextColor(...BODY_T);
-            const rows = [
-                [`${op.sqft.toFixed(1)} sqft`, ''],
-                [`Slabs: ${op.slabQty} × ${fmt$(op.pricePerSlab)}`, fmt$(op.slabCost)],
-                [`${op.isDekton ? 'Dekton cut' : 'Découpe'}`, fmt$(op.cuttingCost)],
-                ['Services', fmt$(op.sharedServices)],
-            ];
-            if (op.sharedCommittedMat > 0) rows.push(['Fixed materials', fmt$(op.sharedCommittedMat)]);
-            for (const [k, v] of rows) {
-                doc.text(k, cx + 5, by);
-                if (v) doc.text(v, cx + cardW - 5, by, { align: 'right' });
-                by += lnH;
-            }
-
-            // Pre-tax
-            by += 6;
-            doc.setDrawColor(...ACCENT); doc.setLineWidth(0.4);
-            doc.line(cx + 5, by - 4, cx + cardW - 5, by - 4);
-            doc.setFont('helvetica','bold'); doc.setFontSize(8); doc.setTextColor(80,68,30);
-            doc.text('Avant taxes', cx + 5, by);
-            doc.setFont('helvetica','italic'); doc.setFontSize(6); doc.setTextColor(130,110,55);
-            doc.text('before tax', cx + 5, by + 6);
-            doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
-            doc.text(fmt$(op.preT), cx + cardW - 5, by + 2, { align: 'right' });
-            by += 18;
-
-            // Total with tax (highlighted)
+            // Right — totals column (accent background)
             doc.setFillColor(...ACCENT);
-            doc.rect(cx + 3, by - 2, cardW - 6, 26, 'F');
-            doc.setFont('helvetica','bold'); doc.setFontSize(8); doc.setTextColor(...BRAND);
-            doc.text('TOTAL', cx + 6, by + 8);
-            doc.setFont('helvetica','italic'); doc.setFontSize(6.5); doc.setTextColor(...BRAND);
-            doc.text('taxes incluses', cx + 6, by + 16);
-            doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(...BRAND);
-            doc.text(fmt$(op.total), cx + cardW - 6, by + 14, { align: 'right' });
+            doc.rect(tx, cy, totalW, rowH, 'F');
+            // Rounded right edge to match card
+            doc.setFillColor(...ACCENT);
+            doc.roundedRect(tx + totalW - 4, cy, 4, rowH, 4, 4, 'F');
+            doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(...BRAND);
+            doc.text('Avant taxes / Before tax', tx + 8, cy + 14);
+            doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...BRAND);
+            doc.text(fmt$(op.preT), tx + totalW - 8, cy + 26, { align: 'right' });
+            // Dividing line
+            doc.setDrawColor(...BRAND); doc.setLineWidth(0.4);
+            doc.line(tx + 8, cy + 33, tx + totalW - 8, cy + 33);
+            doc.setFont('helvetica','bold'); doc.setFontSize(7.5); doc.setTextColor(...BRAND);
+            doc.text('TOTAL — taxes incluses', tx + 8, cy + 44);
+            doc.setFont('helvetica','bold'); doc.setFontSize(14); doc.setTextColor(...BRAND);
+            doc.text(fmt$(op.total), tx + totalW - 8, cy + 58, { align: 'right' });
+
+            y += rowH + 8;
         }
 
-        y += cardH + 14;
-        doc.setFont('helvetica','italic'); doc.setFontSize(7.5); doc.setTextColor(120,100,50);
+        y += 6;
+        doc.setFont('helvetica','italic'); doc.setFontSize(8); doc.setTextColor(120,100,50);
         const note = 'Veuillez choisir une option. / Please select one option — pricing reflects each scenario independently.';
         const noteLines = doc.splitTextToSize(note, CW);
-        for (const ln of noteLines) { doc.text(ln, PW/2, y, { align: 'center' }); y += 10; }
+        for (const ln of noteLines) { doc.text(ln, PW/2, y, { align: 'center' }); y += 11; }
     }
 
-    // Notes
-    if (formData.notes && formData.notes.trim()) {
-        sectionHead('NOTES');
-        doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
-        const lines = doc.splitTextToSize(formData.notes, CW);
-        for (const line of lines) { checkY(13); doc.text(line, ML, y); y += 13; }
-        y += 4;
-    }
+    // (Internal notes intentionally omitted from client-facing proposal)
 
     // Terms note
     checkY(20);
@@ -7594,10 +7979,10 @@ function exportPDF() {
         doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
         for (const m of formData.materials) {
             checkY(13);
-            const t = m.type || 'zone';
-            const tLabel = t === 'option' ? (m.label || `Option ${getOptionLetter(m)}`)
-                         : t === 'page'   ? `Page: ${m.label||'—'}`
-                         : (m.label ? `Zone: ${m.label}` : 'Zone');
+            const t = m.type || 'page';
+            const tLabel = t === 'option'
+                ? (m.label || `Option ${getOptionLetter(m)}`)
+                : `Page: ${m.label||'—'}`;
             [tLabel, m.color||'—', m.supplier||'—', m.thickness||'—', m.finish||'—'].forEach((v, i) => doc.text(v, mc[i], y));
             y += 13;
         }
@@ -8024,7 +8409,17 @@ function renderPageTabs() {
             const newName = nameEl.textContent.trim() || p.name;
             nameEl.textContent = newName;
             p.name = newName;
+            // Update any Page-type material labels linked to this page
+            let matsChanged = false;
+            for (const m of (formData.materials||[])) {
+                if ((m.type||'page') === 'page' && m.pageId === p.id) {
+                    m.label = newName; matsChanged = true;
+                }
+            }
+            if (matsChanged) saveForm();
             persist();
+            renderMaterials();
+            renderPricingPanel();
         });
         nameEl.addEventListener('keydown', e => {
             if (e.key === 'Enter') { e.preventDefault(); nameEl.blur(); }
@@ -8078,18 +8473,30 @@ function addPage() {
     syncPageIn();
     persist();
     renderPageTabs();
+    renderMaterials(); // refresh page-selector dropdowns in material rows
     render(); updateStatus();
 }
 
 function deletePage(idx) {
     if (pages.length <= 1) return;
     if (!confirm(`Delete "${pages[idx].name}"? This cannot be undone.`)) return;
+    const deletedId = pages[idx].id;
     pages.splice(idx, 1);
     if (currentPageIdx >= pages.length) currentPageIdx = pages.length - 1;
     syncPageIn();
     selected = null; selectedJoint = null; selectedText = null;
+    // Unlink any Page-type materials pointing to the deleted page
+    let matsChanged = false;
+    for (const m of (formData.materials||[])) {
+        if ((m.type||'page') === 'page' && m.pageId === deletedId) {
+            m.pageId = null; m.label = ''; matsChanged = true;
+        }
+    }
+    if (matsChanged) saveForm();
     persist();
     renderPageTabs();
+    renderMaterials();
+    renderPricingPanel();
     render(); updateStatus();
 }
 
@@ -9037,8 +9444,8 @@ window.addEventListener('resize', () => { if (kitOpen) { kitResizeCanvas(); kitR
 function initApp() {
     _initSession();
     load();
+    loadMatDb();   // Load material catalog FIRST so brand/color dropdowns render with options
     loadForm();
-    loadMatDb();
     loadPricing();
     // Compute _nextPageId from loaded pages
     _nextPageId = Math.max(...pages.map(p => p.id), 1) + 1;
