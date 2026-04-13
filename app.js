@@ -5573,10 +5573,17 @@ function getServiceLineItems() {
         }
         const rate = R[d.key] || 0;
         let cost = qty * rate;
-        // Installation minimum fee: floor the installation cost if min > 0
+        // Installation: custom override (Pricing tab) wins; else apply min fee floor.
         if (d.key === 'installation') {
-            const minFee = pricingData.installationMin || 0;
-            if (minFee > 0 && cost < minFee) cost = minFee;
+            const instCustomRaw = pricingData.installationCustom;
+            const instCustom = (instCustomRaw != null && instCustomRaw !== '')
+                ? (parseFloat(instCustomRaw) || 0) : 0;
+            if (instCustom > 0) {
+                cost = instCustom;
+            } else {
+                const minFee = pricingData.installationMin || 0;
+                if (minFee > 0 && cost < minFee) cost = minFee;
+            }
         }
         return { ...d, qty, rate, cost, unitLabel };
     }).filter(item => item.qty > 0 || item.rate > 0);
@@ -5755,18 +5762,23 @@ function renderPricingPanel() {
         return { mat, html, matSubtotal };
     }
 
-    // Group materials by type (Page or Option — Zones have been removed)
-    const pagesGrp = [], optionsGrp = [];
+    // Group page-type blocks BY pageId (a page can have 2+ linked materials = per-page options)
+    const optionsGrp = [];
+    const pageBlocksByPageId = new Map(); // pageId -> array of block objects (mat + html + matSubtotal)
+    const unlinkedPageBlocks = [];        // blocks with pageId missing
     for (const [mid, msqft] of Object.entries(matSqftMap)) {
         const b = buildMatBlock(mid, msqft);
         const t = (b.mat.type || 'page');
-        if (t === 'option') optionsGrp.push({ mid, ...b });
-        else                pagesGrp.push({ mid, ...b });  // default: page
+        if (t === 'option') { optionsGrp.push({ mid, ...b }); continue; }
+        // page-type
+        const pid = b.mat.pageId;
+        if (pid == null) { unlinkedPageBlocks.push({ mid, ...b }); continue; }
+        if (!pageBlocksByPageId.has(pid)) pageBlocksByPageId.set(pid, []);
+        pageBlocksByPageId.get(pid).push({ mid, ...b });
     }
 
     // Warn about canvas pages that have shapes but no linked Page-type material
-    const linkedPageIds = new Set(pagesGrp.map(b => b.mat.pageId).filter(Boolean));
-    const orphanPages = pages.filter(p => (pageSqftById[p.id] || 0) > 0 && !linkedPageIds.has(p.id));
+    const orphanPages = pages.filter(p => (pageSqftById[p.id] || 0) > 0 && !pageBlocksByPageId.has(p.id));
     if (orphanPages.length > 0) {
         sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px;border:1px dashed #e0a050;border-radius:6px;padding:8px;background:#1f1b10">
             <div style="color:#e0a050;font-size:11px;font-weight:700;margin-bottom:3px">⚠ Page(s) without a linked material</div>
@@ -5774,16 +5786,54 @@ function renderPricingPanel() {
         </div>`;
     }
 
-    // ── Pages: each Page-material gets its own subtotal section ────
-    for (const b of pagesGrp) {
+    // ── Pages: one section per canvas page, with 1 or more linked materials ──
+    // The committed grand-total assumes the FIRST option of each multi-option page;
+    // full combinations are rendered in their own section below.
+    let anyMultiOptionPage = false;
+    for (const page of pages) {
+        const blocks = pageBlocksByPageId.get(page.id);
+        if (!blocks || blocks.length === 0) continue;
+
+        if (blocks.length === 1) {
+            // Single-material page — render as before
+            const b = blocks[0];
+            materialCostTotal += b.matSubtotal;
+            sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px;border:1px solid #5fb8c2;border-radius:6px;padding:8px;background:#1f1f1f">
+                <div class="price-check-label" style="color:#5fb8c2">PAGE — ${page.name}</div>
+                ${b.html}
+                <div style="text-align:right;margin-top:6px;font-size:12px;font-weight:700;color:#5fb8c2">Page subtotal: ${fmt$(b.matSubtotal)}</div>
+            </div>`;
+        } else {
+            // Multi-option page — render side-by-side option cards
+            anyMultiOptionPage = true;
+            // Committed total uses the FIRST option (used for the "Committed subtotal" label only)
+            materialCostTotal += blocks[0].matSubtotal;
+            let optsInner = '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:stretch">';
+            blocks.forEach((b, i) => {
+                const optLabel = `Option ${i+1}`;
+                const matName = [b.mat.color, b.mat.thickness].filter(Boolean).join(' · ') || 'Material';
+                optsInner += `<div style="flex:1;min-width:240px;background:#141414;border:1px solid #5fb8c2;border-radius:4px;padding:6px;display:flex;flex-direction:column">
+                    <div style="font-size:11px;font-weight:700;color:#5fb8c2;margin-bottom:4px;text-align:center;border-bottom:1px solid #333;padding-bottom:3px">${optLabel} — ${matName}</div>
+                    <div style="flex:1">${b.html}</div>
+                    <div style="text-align:right;margin-top:4px;padding:5px;background:#3d5a68;border-radius:4px;font-size:12px;font-weight:700;color:#5fb8c2">${optLabel} total: ${fmt$(b.matSubtotal)}</div>
+                </div>`;
+            });
+            optsInner += '</div>';
+            sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px;border:1px solid #5fb8c2;border-radius:6px;padding:8px;background:#1f1f1f">
+                <div class="price-check-label" style="color:#5fb8c2">PAGE — ${page.name} · ${blocks.length} options</div>
+                <p style="font-size:9px;color:#888;margin:2px 0 6px;font-style:italic">Client selects one material option for this page. Services on this page are shared across options.</p>
+                ${optsInner}
+            </div>`;
+        }
+    }
+
+    // Unlinked page-materials (safety fallback)
+    for (const b of unlinkedPageBlocks) {
         materialCostTotal += b.matSubtotal;
-        const linkedPage = pages.find(p => p.id === b.mat.pageId);
-        const name = linkedPage ? linkedPage.name : (b.mat.label || 'Unassigned');
-        const unassignedNote = linkedPage ? '' : ' <span style="font-size:9px;color:#e0a050">(not linked to any page)</span>';
-        sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px;border:1px solid #5fb8c2;border-radius:6px;padding:8px;background:#1f1f1f">
-            <div class="price-check-label" style="color:#5fb8c2">PAGE — ${name}${unassignedNote}</div>
+        sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px;border:1px dashed #e0a050;border-radius:6px;padding:8px;background:#1a1a1a">
+            <div class="price-check-label" style="color:#e0a050">Unassigned material <span style="font-size:9px">(not linked to any page)</span></div>
             ${b.html}
-            <div style="text-align:right;margin-top:6px;font-size:12px;font-weight:700;color:#5fb8c2">Page subtotal: ${fmt$(b.matSubtotal)}</div>
+            <div style="text-align:right;margin-top:6px;font-size:12px;font-weight:700;color:#5fb8c2">Subtotal: ${fmt$(b.matSubtotal)}</div>
         </div>`;
     }
 
@@ -5828,27 +5878,37 @@ function renderPricingPanel() {
         </div>
     </div>`;
 
-    // ── Installation (with minimum fee) ──────────────────────
-    const instItem = allServiceItems.find(i => i.key === 'installation');
+    // ── Installation (with minimum fee + optional custom override) ───
+    // Costs tab "Installation min. fee" (pricingData.installationMin) is applied silently
+    // as a floor. The Pricing tab also exposes a "Custom install price"
+    // (pricingData.installationCustom) that, when set, OVERRIDES the computed value.
     const instRate = pricingData.rates.installation || 0;
+    const instItem = allServiceItems.find(i => i.key === 'installation');
     const instSqft = instItem ? instItem.qty : 0;
     const instRawCost = instSqft * instRate;
     const instMin = pricingData.installationMin || 0;
-    const instCost = instItem ? instItem.cost : Math.max(instRawCost, instMin);
-    const instMinApplied = instMin > 0 && instRawCost < instMin;
-    if (instRate > 0 || instMin > 0) serviceCostTotal += instCost;
+    const instCustom = (pricingData.installationCustom != null && pricingData.installationCustom !== '')
+        ? (parseFloat(pricingData.installationCustom) || 0) : null;
+    const instCustomActive = instCustom != null && instCustom > 0;
+    const instCost = instCustomActive ? instCustom : Math.max(instRawCost, instMin);
+    const instMinApplied = !instCustomActive && instMin > 0 && instRawCost < instMin;
+    if (instRate > 0 || instMin > 0 || instCustomActive) serviceCostTotal += instCost;
 
     sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px">
         <div class="price-check-label">Installation</div>
         <div style="display:flex;align-items:center;gap:6px;padding:3px 0">
             <span style="font-size:10px;color:#999;flex:1">${instSqft.toFixed(2)} sqft × ${fmt$(instRate)}</span>
-            <span style="font-size:10px;color:${instMinApplied?'#777':'#5fb8c2'};${instMinApplied?'text-decoration:line-through':''}">${fmt$(instRawCost)}</span>
+            <span style="font-size:10px;color:${instCustomActive ? '#777' : (instMinApplied?'#777':'#5fb8c2')};${(instCustomActive || instMinApplied) ? 'text-decoration:line-through' : ''}">${fmt$(Math.max(instRawCost, instMin))}</span>
         </div>
         <div style="display:flex;align-items:center;gap:6px;padding:3px 0">
             <span style="font-size:10px;color:#999">Min. fee</span>
             <input class="mat-input" id="pricing-inst-min" type="number" min="0" step="1" value="${instMin}" style="width:70px;text-align:right">
             <span style="font-size:9px;color:${instMinApplied?'#e0a050':'#555'};margin-left:6px">${instMinApplied ? 'min applied' : ''}</span>
-            <span style="font-size:11px;font-weight:700;color:#5fb8c2;margin-left:auto">${fmt$(instCost)}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;padding:3px 0">
+            <span style="font-size:10px;color:#999;flex:1">Custom install price <span style="font-size:8.5px;color:#666">(leave blank to use calculated)</span></span>
+            <input class="mat-input" id="pricing-inst-custom" type="text" inputmode="decimal" value="${instCustom != null ? instCustom : ''}" placeholder="—" style="width:90px;text-align:right">
+            <span style="font-size:11px;font-weight:700;color:#5fb8c2;margin-left:6px">${fmt$(instCost)}</span>
         </div>
     </div>`;
 
@@ -5871,13 +5931,80 @@ function renderPricingPanel() {
 
     // ── Grand total of committed costs (pages + services) ──
     const committedTotal = materialCostTotal + serviceCostTotal;
-    const committedLabel = optionsGrp.length > 0 ? 'Committed subtotal (shared)' : 'Grand Total';
+    const TAX = 1.14975;
+    const committedWithTax = committedTotal * TAX;
+    let committedLabel;
+    if (optionsGrp.length > 0)        committedLabel = 'Committed subtotal (shared)';
+    else if (anyMultiOptionPage)      committedLabel = 'Reference total — using Option 1 of each multi-option page';
+    else                              committedLabel = 'Grand Total';
     sumHtml += `<div class="room-pricing-section" style="margin-top:8px;padding:8px;background:#3d5a68;border:1px solid #5fb8c2;border-radius:6px">
-        <div class="price-check-row" style="font-weight:bold;font-size:14px">
-            <span class="price-check-name">${committedLabel}</span>
+        <div class="price-check-row" style="font-weight:bold;font-size:13px">
+            <span class="price-check-name">${committedLabel} (pre-tax)</span>
             <span class="price-check-val">${fmt$(committedTotal)}</span>
         </div>
+        <div class="price-check-row" style="font-weight:bold;font-size:14px;color:#5fb8c2;border-top:1px solid #555;margin-top:4px;padding-top:4px">
+            <span class="price-check-name">With taxes (GST 5% + QST 9.975%)</span>
+            <span class="price-check-val">${fmt$(committedWithTax)}</span>
+        </div>
     </div>`;
+
+    // ── Combinations summary (cross-product of per-page options) ──
+    if (anyMultiOptionPage) {
+        const pageEntries = [];
+        for (const page of pages) {
+            const blocks = pageBlocksByPageId.get(page.id);
+            if (!blocks || blocks.length === 0) continue;
+            pageEntries.push({ page, blocks });
+        }
+        let combos = [[]];
+        for (const { page, blocks } of pageEntries) {
+            const nc = [];
+            for (const c of combos) {
+                for (let i = 0; i < blocks.length; i++) {
+                    nc.push([...c, { page, blockIdx: i, block: blocks[i] }]);
+                }
+            }
+            combos = nc;
+        }
+
+        let combosHtml = `<div class="room-pricing-section" style="margin-top:10px;border:2px dashed #5fb8c2;border-radius:6px;padding:8px">
+            <div class="price-check-label" style="color:#5fb8c2">COMBINATIONS — ${combos.length} possible scenario${combos.length>1?'s':''}</div>
+            <p style="font-size:9px;color:#999;margin:2px 0 8px;font-style:italic">Cross-product of per-page options. Shared project services are added once per combination.</p>`;
+        combos.forEach((combo, ci) => {
+            let matSum = 0;
+            const picks = combo.map(c => {
+                matSum += c.block.matSubtotal;
+                const matName = [c.block.mat.color, c.block.mat.thickness].filter(Boolean).join(' · ') || 'Material';
+                const n = pageBlocksByPageId.get(c.page.id).length;
+                const optLabel = n > 1 ? ` · Option ${c.blockIdx+1}` : '';
+                return { name: `${c.page.name}${optLabel} (${matName})`, cost: c.block.matSubtotal };
+            });
+            const preT = matSum + serviceCostTotal;
+            const withTax = preT * TAX;
+            combosHtml += `<div style="margin-bottom:8px;padding:8px;background:#141414;border:1px solid #333;border-radius:4px">
+                <div style="font-size:11px;font-weight:700;color:#5fb8c2;margin-bottom:4px">Combination ${ci+1}</div>
+                ${picks.map(p => `<div style="display:flex;justify-content:space-between;font-size:10px;color:#ccc;padding:2px 0">
+                    <span>${p.name}</span>
+                    <span>${fmt$(p.cost)}</span>
+                </div>`).join('')}
+                <div style="display:flex;justify-content:space-between;font-size:10px;color:#aaa;padding:2px 0;border-top:1px dashed #333;margin-top:3px">
+                    <span>Project services (shared)</span>
+                    <span>${fmt$(serviceCostTotal)}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:#ccc;padding:3px 6px;border-top:1px solid #333;margin-top:3px">
+                    <span>Pre-tax subtotal</span>
+                    <span style="font-weight:700">${fmt$(preT)}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;font-weight:700;color:#5fb8c2;padding:5px 6px;border-top:1px solid #5fb8c2;margin-top:1px;background:#3d5a68;border-radius:3px">
+                    <span>TOTAL with taxes — Combo ${ci+1}</span>
+                    <span>${fmt$(withTax)}</span>
+                </div>
+                <div style="font-size:8.5px;color:#777;text-align:right;margin-top:2px;font-style:italic">GST 5% + QST 9.975% — matches client proposal PDF</div>
+            </div>`;
+        });
+        combosHtml += '</div>';
+        sumHtml += combosHtml;
+    }
 
     // ── Options: side-by-side scenarios, each = committed baseline + option's own material ──
     if (optionsGrp.length > 0) {
@@ -5907,20 +6034,26 @@ function renderPricingPanel() {
     summaryContainer.innerHTML = sumHtml;
 
     // ── Wire up interactive inputs ───────────────────────────
-    // Slab qty
-    summaryContainer.querySelectorAll('.pricing-slab-qty').forEach(inp => inp.addEventListener('input', e => {
-        const mid = e.target.dataset.mid;
-        if (!pricingData.slabOverrides[mid]) pricingData.slabOverrides[mid] = {};
-        pricingData.slabOverrides[mid].qty = parseInt(e.target.value) || 0;
-        savePricing(); renderPricingPanel();
-    }));
-    // Slab custom price
-    summaryContainer.querySelectorAll('.pricing-slab-price').forEach(inp => inp.addEventListener('input', e => {
-        const mid = e.target.dataset.mid;
-        if (!pricingData.slabOverrides[mid]) pricingData.slabOverrides[mid] = {};
-        pricingData.slabOverrides[mid].customPrice = parseFloat(e.target.value) || 0;
-        savePricing(); renderPricingPanel();
-    }));
+    // Slab qty — `change` fires on blur/Enter so typing stays focused
+    summaryContainer.querySelectorAll('.pricing-slab-qty').forEach(inp => {
+        inp.addEventListener('change', e => {
+            const mid = e.target.dataset.mid;
+            if (!pricingData.slabOverrides[mid]) pricingData.slabOverrides[mid] = {};
+            pricingData.slabOverrides[mid].qty = parseInt(e.target.value) || 0;
+            savePricing(); renderPricingPanel();
+        });
+        inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); inp.blur(); } });
+    });
+    // Slab custom price — same treatment
+    summaryContainer.querySelectorAll('.pricing-slab-price').forEach(inp => {
+        inp.addEventListener('change', e => {
+            const mid = e.target.dataset.mid;
+            if (!pricingData.slabOverrides[mid]) pricingData.slabOverrides[mid] = {};
+            pricingData.slabOverrides[mid].customPrice = parseFloat(e.target.value) || 0;
+            savePricing(); renderPricingPanel();
+        });
+        inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); inp.blur(); } });
+    });
     // Polissage sous toggle
     const psToggle = document.getElementById('pricing-ps-toggle');
     if (psToggle) psToggle.addEventListener('change', e => {
@@ -5949,6 +6082,24 @@ function renderPricingPanel() {
         pricingData.installationMin = parseFloat(e.target.value) || 0;
         savePricing(); renderPricingPanel();
     });
+    // Custom install price — fires on blur/Enter (NOT input) so typing stays focused
+    const instCustInp = document.getElementById('pricing-inst-custom');
+    if (instCustInp) {
+        instCustInp.addEventListener('change', e => {
+            const raw = (e.target.value || '').toString().trim();
+            if (raw === '') {
+                delete pricingData.installationCustom;
+            } else {
+                const v = parseFloat(raw);
+                pricingData.installationCustom = isNaN(v) ? '' : v;
+            }
+            savePricing(); renderPricingPanel();
+        });
+        // Commit on Enter key too
+        instCustInp.addEventListener('keydown', e => {
+            if (e.key === 'Enter') { e.preventDefault(); instCustInp.blur(); }
+        });
+    }
 }
 
 // Re-render only the summary (not rate inputs) to avoid losing focus
@@ -7625,6 +7776,94 @@ function calcPagePricing(page) {
     };
 }
 
+// Per-page pricing for all linked materials (multi-option pages).
+// Returns shared page services + an options[] array, one entry per linked material.
+// If 2+ materials are linked to the same page, they are treated as options the
+// client must choose between.
+function calcPageOptions(page) {
+    const roomSqft = calcPageSqft(page);
+    const mats = (formData.materials||[]).filter(m =>
+        (m.type||'page') === 'page' && m.pageId === page.id
+    );
+
+    // Edge services (shared across options)
+    const edgeFootage = calcPageEdgeFootage(page);
+    const pencilLf = (edgeFootage.pencil || 0) + (edgeFootage.polished || 0);
+    const fini45Lf = edgeFootage.waterfall || 0;
+    const lamineLf = edgeFootage.mitered || 0;
+    const pencilCost = pencilLf * (pricingData.rates.pencil || 0);
+    const fini45Cost = fini45Lf * (pricingData.rates.fini45 || 0);
+    const lamineCost = lamineLf * (pricingData.rates.lamine || 0);
+
+    // Sink/cooktop/farmhouse (shared across options)
+    const sinks = calcPageSinkCounts(page);
+    const evierOverCost   = sinks.overmount  * (pricingData.rates.evierOver   || 0);
+    const evierUnderCost  = sinks.undermount * (pricingData.rates.evierUnder  || 0);
+    const evierVasqueCost = sinks.vasque     * (pricingData.rates.evierVasque || 0);
+    const cooktopCost     = sinks.cooktops   * (pricingData.rates.cooktop     || 0);
+    const farmSinkCost    = sinks.farmSinks  * (pricingData.rates.farmSink    || 0);
+
+    const servicesCost = pencilCost + fini45Cost + lamineCost
+                       + evierOverCost + evierUnderCost + evierVasqueCost
+                       + cooktopCost + farmSinkCost;
+
+    // Per-option (material + cutting); services are added to each option's subtotal.
+    // Material cost uses the SAME slab-based calculation as the pricing tab (respects
+    // user overrides for slab qty + price per slab via pricingData.slabOverrides).
+    const options = mats.map(mat => {
+        const isDekton = (mat.supplier||'').toLowerCase().includes('dekton')
+                      || (mat.color   ||'').toLowerCase().includes('dekton')
+                      || (mat.thickness||'').toLowerCase().includes('dekton');
+        const dbCostPerSlab = getMatCostPerSlab(mat.id);
+        const slabSqft = getMatSlabSqft(mat.id);
+        const suggestedQty = slabSqft > 0 ? Math.ceil(roomSqft / slabSqft) : 1;
+        const ov = (pricingData.slabOverrides||{})[mat.id] || {};
+        const slabQty = ov.qty != null ? ov.qty : suggestedQty;
+        const useCustom = ov.customPrice != null && ov.customPrice >= 0;
+        const pricePerSlab = useCustom ? ov.customPrice : dbCostPerSlab;
+        const matCost = slabQty * pricePerSlab;
+        const cutRate = isDekton ? (pricingData.rates.dektonCoupe||0) : (pricingData.rates.coupe||0);
+        const cutCost = roomSqft * cutRate;
+        const optionSubtotal = matCost + cutCost + servicesCost;
+        return { material: mat, isDekton, slabQty, pricePerSlab, matCost, cutCost, cutRate, optionSubtotal };
+    });
+
+    return {
+        page, roomSqft,
+        edgeFootage, pencilLf, fini45Lf, lamineLf, pencilCost, fini45Cost, lamineCost,
+        sinks, evierOverCost, evierUnderCost, evierVasqueCost, cooktopCost, farmSinkCost,
+        servicesCost,
+        options,                      // one entry per linked material (0+ entries)
+        multi: options.length > 1     // convenience flag
+    };
+}
+
+// Cross-product of per-page options across all pages that have shapes.
+// Returns { pageOptionsList: [calcPageOptions(p), ...], combos: [[{pageOpt, optionIdx},...], ...] }.
+function calcAllCombinations() {
+    const pageOptionsList = [];
+    for (const page of pages) {
+        const po = calcPageOptions(page);
+        if (po.roomSqft <= 0) continue;   // skip empty canvas pages
+        pageOptionsList.push(po);
+    }
+    if (pageOptionsList.length === 0) return { combos: [], pageOptionsList };
+
+    // Cross-product — pages with zero options contribute a null selection.
+    let combos = [[]];
+    for (const po of pageOptionsList) {
+        const nextCombos = [];
+        const n = Math.max(1, po.options.length);
+        for (const combo of combos) {
+            for (let i = 0; i < n; i++) {
+                nextCombos.push([...combo, { pageOpt: po, optionIdx: po.options.length > 0 ? i : -1 }]);
+            }
+        }
+        combos = nextCombos;
+    }
+    return { combos, pageOptionsList };
+}
+
 // Project-wide fees applied once (not attributable to a single page)
 function calcProjectFees() {
     let totalSqft = 0;
@@ -7632,15 +7871,20 @@ function calcProjectFees() {
     const installRate = pricingData.rates.installation || 0;
     const installMin  = pricingData.installationMin   || 0;
     const installRaw  = totalSqft * installRate;
-    const installCost = Math.max(installRaw, installMin);
-    const installMinApplied = installMin > 0 && installRaw < installMin;
+    // "Custom install price" in Pricing tab wins when set (any positive value)
+    const instCustomRaw = pricingData.installationCustom;
+    const installCustom = (instCustomRaw != null && instCustomRaw !== '')
+        ? (parseFloat(instCustomRaw) || 0) : 0;
+    const installCost = installCustom > 0 ? installCustom : Math.max(installRaw, installMin);
+    const installMinApplied = installCustom <= 0 && installMin > 0 && installRaw < installMin;
+    const installCustomUsed = installCustom > 0;
     const measEnabled = pricingData.measurementsEnabled !== false;
     const measCost    = measEnabled ? (pricingData.rates.measurements || 0) : 0;
     const polQty      = pricingData.polissageSousQty || 0;
     const polCost     = polQty * (pricingData.rates.polissageSous || 0);
     return {
         totalSqft,
-        installRate, installMin, installRaw, installCost, installMinApplied,
+        installRate, installMin, installRaw, installCost, installMinApplied, installCustomUsed, installCustom,
         measEnabled, measCost,
         polQty, polCost,
         total: installCost + measCost + polCost
@@ -7906,24 +8150,34 @@ function generateProposal() {
     const PANEL_W = 190;
     const savedIdx = currentPageIdx;
     dimSizeMultiplier = 1.5;
-    // Estimate panel content height (material header + edges + services + subtotal)
-    function panelContentH(pp) {
-        let h = 27; // room name header + separator
-        if (pp.pageMat) h += 11 + 9 + 6; // material name + details + spacer
+    // Estimate panel content height for a page with 1+ option(s) (supports multi-option pages)
+    function panelContentH(po) {
+        let h = 22; // room name header + separator
         h += 10; // sqft
-        const edgeTypes = Object.keys(pp.edgeFootage);
+        const edgeTypes = Object.keys(po.edgeFootage);
         if (edgeTypes.length > 0) h += 8 + edgeTypes.length * 9 + 7;
-        // Service rows
         let nServiceLines = 0;
-        if (pp.sinks.overmount  > 0) nServiceLines++;
-        if (pp.sinks.undermount > 0) nServiceLines++;
-        if (pp.sinks.vasque     > 0) nServiceLines++;
-        if (pp.sinks.cooktops   > 0) nServiceLines++;
+        if (po.sinks.overmount  > 0) nServiceLines++;
+        if (po.sinks.undermount > 0) nServiceLines++;
+        if (po.sinks.vasque     > 0) nServiceLines++;
+        if (po.sinks.cooktops   > 0) nServiceLines++;
+        if (po.sinks.farmSinks  > 0) nServiceLines++;
         if (nServiceLines > 0) h += 8 + nServiceLines * 9 + 7;
-        // Price breakdown
-        if (pp.pageMat) h += 8 + 10 + 10 + 6; // header + mat line + cut line + sep
-        if (pp.servicesCost > 0) h += 10; // services line
-        h += 24; // page subtotal box
+        if (po.options.length === 0) {
+            if (po.servicesCost > 0) h += 26;
+        } else {
+            po.options.forEach((opt, i) => {
+                if (po.options.length > 1) h += 9; // "OPTION N" label
+                h += 10; // material name
+                const matDet = [opt.material.supplier, opt.material.thickness, opt.material.finish].filter(Boolean).join(' • ');
+                if (matDet) h += 8;
+                h += 10; // matériel + découpe
+                if (po.servicesCost > 0) h += 10; // services line
+                h += 26; // subtotal box
+                if (i < po.options.length - 1) h += 6; // gap
+            });
+        }
+        h += 6; // bottom padding
         return h;
     }
 
@@ -7962,8 +8216,8 @@ function generateProposal() {
     selected = null; selectedDiag = null; selectedText = null; selectedJoint = null;
     hovCorner = null; hovEdge = null;
 
-    // Collect per-page pricing for the final summary
-    const pagePricings = [];
+    // Collect per-page pricing for the final summary (now option-aware)
+    const pageOptionsByPage = []; // array of po objects (calcPageOptions output)
 
     // Project-level fees (install + measurements + polissage) are allocated into
     // each page proportionally by sqft so they appear up-front in the room breakdown.
@@ -7983,15 +8237,15 @@ function generateProposal() {
         currentPageIdx = pi; syncPageIn(); render();
 
         const { dataURL: imgData, w: natW, h: natH } = croppedCanvasData(page);
-        const pp = calcPagePricing(page);
-        // Allocate project-level fees into this page and roll them into the subtotal
-        const feeShare = feeShareForPage(pp.roomSqft);
-        pp.feeShare    = feeShare;
-        pp.servicesCost += feeShare.total;
-        pp.pageSubtotal += feeShare.total;
-        pagePricings.push(pp);
-        const { roomSqft, pageMat, edgeFootage, sinks } = pp;
-        const contentH = panelContentH(pp);
+        const po = calcPageOptions(page);
+        // Allocate project-level fees into this page and roll them into every subtotal
+        const feeShare = feeShareForPage(po.roomSqft);
+        po.feeShare   = feeShare;
+        po.servicesCost += feeShare.total;
+        for (const opt of po.options) opt.optionSubtotal += feeShare.total;
+        pageOptionsByPage.push(po);
+        const { roomSqft, edgeFootage, sinks, options } = po;
+        const contentH = panelContentH(po);
 
         // Fixed zones: image always left 364pt, panel always right 148pt
         const IMG_ZONE_W = CW - PANEL_W - 10; // 364pt
@@ -8028,26 +8282,12 @@ function generateProposal() {
 
         let py2 = y + 12;
 
-        // Room name header
+        // Room name header (with multi-option indicator)
         doc.setFont('helvetica','bold'); doc.setFontSize(8); doc.setTextColor(...BRAND);
-        doc.text(page.name.toUpperCase(), px + pw/2, py2, {align:'center'});
+        doc.text(page.name.toUpperCase() + (options.length > 1 ? ` · ${options.length} OPTIONS` : ''), px + pw/2, py2, {align:'center'});
         py2 += 5;
         doc.setDrawColor(...ACCENT); doc.setLineWidth(0.4);
         doc.line(px+5, py2, px+pw-5, py2); py2 += 9;
-
-        // ── Material for this page ──
-        if (pageMat) {
-            doc.setFont('helvetica','bold'); doc.setFontSize(8); doc.setTextColor(...BODY_T);
-            doc.text(doc.splitTextToSize(pageMat.color || 'Matériau', pw-10)[0], px+5, py2);
-            py2 += 9;
-            const matDet = [pageMat.supplier, pageMat.thickness, pageMat.finish].filter(Boolean).join(' • ');
-            if (matDet) {
-                doc.setFont('helvetica','normal'); doc.setFontSize(6.5); doc.setTextColor(100,85,40);
-                doc.text(doc.splitTextToSize(matDet, pw-10)[0], px+5, py2);
-                py2 += 8;
-            }
-            py2 += 4;
-        }
 
         // ── Square footage ──
         doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(80,68,30);
@@ -8056,7 +8296,7 @@ function generateProposal() {
         doc.text(`${roomSqft.toFixed(2)} pi² / ft²`, px+pw-5, py2, {align:'right'});
         py2 += 10;
 
-        // ── Edge footage by profile ──
+        // ── Edge footage by profile (shared across options) ──
         const edgeTypes = Object.keys(edgeFootage);
         if (edgeTypes.length > 0) {
             doc.setFont('helvetica','bold'); doc.setFontSize(6.5); doc.setTextColor(...BRAND);
@@ -8081,7 +8321,11 @@ function generateProposal() {
             doc.line(px+5, py2, px+pw-5, py2); py2 += 7;
         }
 
-        // ── Sink / cooktop services (counts) ──
+        // ── Sink / cooktop services (counts, shared across options) ──
+        // Installation / measurements / polissage are NOT itemized here — they are
+        // rolled silently into each option's pre-tax subtotal (see po.servicesCost
+        // += feeShare.total above). The subtotal label calls this out so the
+        // client knows install + measurements are already included.
         const serviceRows = [];
         if (sinks.overmount  > 0) serviceRows.push(['Évier overmount',  sinks.overmount]);
         if (sinks.undermount > 0) serviceRows.push(['Évier undermount', sinks.undermount]);
@@ -8103,38 +8347,66 @@ function generateProposal() {
             doc.line(px+5, py2, px+pw-5, py2); py2 += 7;
         }
 
-        // ── Price breakdown ──
-        if (pageMat) {
-            doc.setFont('helvetica','bold'); doc.setFontSize(6.5); doc.setTextColor(...BRAND);
-            doc.text('PRIX / PRICE', px+5, py2);
-            py2 += 8;
-            doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(60,50,20);
-            doc.text('Matériel + découpe', px+5, py2);
-            doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BODY_T);
-            doc.text(fmt$(pp.matCost + pp.cutCost), px+pw-5, py2, {align:'right'});
-            py2 += 10;
-        }
-        if (pp.servicesCost > 0) {
-            doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(60,50,20);
-            doc.text('Services', px+5, py2);
-            doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BODY_T);
-            doc.text(fmt$(pp.servicesCost), px+pw-5, py2, {align:'right'});
-            py2 += 10;
-        }
-
-        // ── Page subtotal box (highlighted) ──
-        // Note: pp.servicesCost and pp.pageSubtotal already include this page's
+        // ── Per-option price blocks ──
+        // Note: po.servicesCost and opt.optionSubtotal already include each page's
         // sqft-proportional share of install / measurements / polissage.
-        const hasFees = (pp.feeShare && pp.feeShare.total > 0);
-        doc.setFillColor(...ACCENT);
-        doc.rect(px+3, py2, pw-6, 20, 'F');
-        doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BRAND);
-        doc.text('SOUS-TOTAL', px+7, py2+9);
-        doc.setFont('helvetica','italic'); doc.setFontSize(5.5); doc.setTextColor(...BRAND);
-        doc.text(hasFees ? 'pre-tax · incl. install + mesures' : 'subtotal (before tax)', px+7, py2+16);
-        doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...BRAND);
-        doc.text(fmt$(pp.pageSubtotal), px+pw-7, py2+14, {align:'right'});
-        py2 += 24;
+        const hasFees = (po.feeShare && po.feeShare.total > 0);
+        if (options.length === 0) {
+            if (po.servicesCost > 0) {
+                doc.setFillColor(...ACCENT);
+                doc.rect(px+3, py2, pw-6, 20, 'F');
+                doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BRAND);
+                doc.text('SOUS-TOTAL', px+7, py2+9);
+                doc.setFont('helvetica','italic'); doc.setFontSize(5.5); doc.setTextColor(...BRAND);
+                doc.text(hasFees ? 'incl. install + mesures' : 'services only', px+7, py2+16);
+                doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...BRAND);
+                doc.text(fmt$(po.servicesCost), px+pw-7, py2+14, {align:'right'});
+                py2 += 26;
+            }
+        } else {
+            options.forEach((opt, i) => {
+                if (options.length > 1) {
+                    doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BRAND);
+                    doc.text(`OPTION ${i+1}`, px+5, py2);
+                    py2 += 9;
+                }
+                // Material name
+                doc.setFont('helvetica','bold'); doc.setFontSize(8); doc.setTextColor(...BODY_T);
+                doc.text(doc.splitTextToSize(opt.material.color || 'Matériau', pw-10)[0], px+5, py2);
+                py2 += 10;
+                const matDet = [opt.material.supplier, opt.material.thickness, opt.material.finish].filter(Boolean).join(' • ');
+                if (matDet) {
+                    doc.setFont('helvetica','normal'); doc.setFontSize(6.5); doc.setTextColor(100,85,40);
+                    doc.text(doc.splitTextToSize(matDet, pw-10)[0], px+5, py2);
+                    py2 += 8;
+                }
+                // Matériel + découpe
+                doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(60,50,20);
+                doc.text('Matériel + découpe', px+5, py2);
+                doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BODY_T);
+                doc.text(fmt$(opt.matCost + opt.cutCost), px+pw-5, py2, {align:'right'});
+                py2 += 10;
+                // Services (sinks + allocated install/measurements/polissage)
+                if (po.servicesCost > 0) {
+                    doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(60,50,20);
+                    doc.text('Services', px+5, py2);
+                    doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BODY_T);
+                    doc.text(fmt$(po.servicesCost), px+pw-5, py2, {align:'right'});
+                    py2 += 10;
+                }
+                // Subtotal box
+                doc.setFillColor(...ACCENT);
+                doc.rect(px+3, py2, pw-6, 20, 'F');
+                doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BRAND);
+                doc.text(options.length > 1 ? `OPT ${i+1} SOUS-TOTAL` : 'SOUS-TOTAL', px+7, py2+9);
+                doc.setFont('helvetica','italic'); doc.setFontSize(5.5); doc.setTextColor(...BRAND);
+                doc.text(hasFees ? 'pre-tax · incl. install + mesures' : 'subtotal (before tax)', px+7, py2+16);
+                doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...BRAND);
+                doc.text(fmt$(opt.optionSubtotal), px+pw-7, py2+14, {align:'right'});
+                py2 += 26;
+                if (i < options.length - 1) py2 += 6;
+            });
+        }
 
         y += panelH + 16;
     }
@@ -8144,66 +8416,103 @@ function generateProposal() {
     selectedJoint = _pSavedJoint; hovCorner = _pSavedHovC; hovEdge = _pSavedHovE;
     syncPageIn(); render();
 
-    // ── PROJECT SUMMARY — sums per-page subtotals + project-level fees ──
-    // Skipped when Options exist (the options section below supplies full scenario totals).
+    // ── PROJECT SUMMARY / COMBINATIONS ──
+    // Skipped when whole-project Options exist (those get their own section below).
     const __preOptsum = calcOptionsSummary();
-    const hasOptions = __preOptsum.options.length > 0;
-    if (!hasOptions && pagePricings.length > 0) {
+    const hasWholeProjectOptions = __preOptsum.options.length > 0;
+    const pagesWithShapes = pageOptionsByPage.filter(po => po.roomSqft > 0);
+    const anyMulti = pagesWithShapes.some(po => po.options.length > 1);
+
+    if (!hasWholeProjectOptions && pagesWithShapes.length > 0) {
         const TAX = 1.14975;
-        // Each page subtotal already includes its share of install + measurements + polissage,
-        // so the project total is just the sum of page subtotals.
-        const pagesSubtotal = pagePricings.reduce((s, pp) => s + pp.pageSubtotal, 0);
-        const preT = pagesSubtotal;
-        const withTax = preT * TAX;
 
-        // Room for the summary block (force new page if needed)
-        const needH = 60 + pagePricings.length * 14 + 14 * 2 + 30;
-        if (y + needH > PH - FOOTER_H - 10) newPdfPage();
+        // Force summary onto a clean page so it always reads as the conclusion
+        newPdfPage();
+        y = 90;
+        sectionHead(anyMulti ? 'SOMMAIRE — COMBINAISONS POSSIBLES / POSSIBLE COMBINATIONS' : 'SOMMAIRE DU PROJET / PROJECT SUMMARY');
 
-        sectionHead('SOMMAIRE DU PROJET / PROJECT SUMMARY');
-
-        // Per-page rows — each subtotal already includes installation, measurements
-        // and polissage allocated by sqft.
-        doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
-        for (const pp of pagePricings) {
-            checkY(13);
-            doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
-            doc.text(pp.page.name, ML + 6, y);
-            const matText = pp.pageMat ? (pp.pageMat.color || '') : '(no material)';
-            doc.setFont('helvetica','italic'); doc.setFontSize(7.5); doc.setTextColor(120,100,50);
-            doc.text(matText, ML + 110, y);
-            doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
-            doc.text(fmt$(pp.pageSubtotal), PW - MR - 6, y, {align:'right'});
-            y += 13;
+        // Build cross-product of per-page options
+        let combos = [[]];
+        for (const po of pagesWithShapes) {
+            const n = Math.max(1, po.options.length);
+            const nc = [];
+            for (const c of combos) {
+                for (let i = 0; i < n; i++) {
+                    nc.push([...c, { po, optionIdx: po.options.length > 0 ? i : -1 }]);
+                }
+            }
+            combos = nc;
         }
 
-        // Page subtotal divider
-        y += 2;
-        doc.setDrawColor(...ACCENT); doc.setLineWidth(0.4);
-        doc.line(ML, y, PW - MR, y);
-        y += 11;
+        if (anyMulti) {
+            doc.setFont('helvetica','italic'); doc.setFontSize(8); doc.setTextColor(120,100,50);
+            doc.text(`${combos.length} combination${combos.length>1?'s':''} — one per possible client selection`, ML, y, {maxWidth: CW});
+            y += 14;
+        }
 
-        // Pre-tax total (install + measurements already included in page subtotals)
-        checkY(20);
-        doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(80,68,30);
-        doc.text('Total avant taxes / Subtotal before tax', ML + 6, y);
-        doc.setFont('helvetica','italic'); doc.setFontSize(7); doc.setTextColor(120,100,50);
-        doc.text('install + mesures inclus', ML + 6, y + 9);
-        doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(...BODY_T);
-        doc.text(fmt$(preT), PW - MR - 6, y, {align:'right'});
-        y += 22;
+        // Render each combination as a bordered card
+        combos.forEach((combo, ci) => {
+            const cardH = 30 + combo.length * 12 + 28; // header + rows + total (fees are baked into page subtotals)
+            if (y + cardH > PH - FOOTER_H - 10) newPdfPage();
+            const cy = y;
 
-        // Grand total with tax (highlighted)
-        checkY(36);
-        doc.setFillColor(...ACCENT);
-        doc.rect(ML, y, CW, 32, 'F');
-        doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(...BRAND);
-        doc.text('GRAND TOTAL', ML + 10, y + 14);
-        doc.setFont('helvetica','italic'); doc.setFontSize(8); doc.setTextColor(...BRAND);
-        doc.text('taxes incluses / with taxes (GST 5% + QST 9.975%)', ML + 10, y + 24);
-        doc.setFont('helvetica','bold'); doc.setFontSize(16); doc.setTextColor(...BRAND);
-        doc.text(fmt$(withTax), PW - MR - 10, y + 22, {align:'right'});
-        y += 40;
+            // Card background
+            doc.setFillColor(252, 250, 243);
+            doc.setDrawColor(...ACCENT); doc.setLineWidth(0.7);
+            doc.roundedRect(ML, cy, CW, cardH, 4, 4, 'FD');
+
+            // Header bar
+            doc.setFillColor(...BRAND);
+            doc.rect(ML, cy, CW, 18, 'F');
+            doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(255,255,255);
+            doc.text(anyMulti ? `COMBINAISON ${ci+1} / COMBINATION ${ci+1}` : 'SOMMAIRE / SUMMARY', ML + 10, cy + 12);
+
+            // Combo rows — each page subtotal already includes its share of
+            // install / measurements / polissage (allocated by sqft).
+            let ry = cy + 30;
+            let matSum = 0;
+            for (const pick of combo) {
+                const po2 = pick.po;
+                const opt = pick.optionIdx >= 0 ? po2.options[pick.optionIdx] : null;
+                const subtotal = opt ? opt.optionSubtotal : po2.servicesCost;
+                matSum += subtotal;
+                const pageLabel = po2.options.length > 1
+                    ? `${po2.page.name} — Option ${pick.optionIdx+1}`
+                    : po2.page.name;
+                const matName = opt ? (opt.material.color || 'Matériau') : '(services only)';
+                doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
+                doc.text(pageLabel, ML + 10, ry);
+                doc.setFont('helvetica','italic'); doc.setFontSize(8); doc.setTextColor(120,100,50);
+                doc.text(matName, ML + 140, ry);
+                doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
+                doc.text(fmt$(subtotal), ML + CW - 10, ry, {align:'right'});
+                ry += 12;
+            }
+
+            // Pre-tax totals line
+            const preT = matSum;
+            const withTax = preT * TAX;
+            ry += 2;
+            doc.setDrawColor(...ACCENT); doc.setLineWidth(0.4);
+            doc.line(ML + 10, ry, ML + CW - 10, ry);
+            ry += 6;
+            doc.setFont('helvetica','bold'); doc.setFontSize(8); doc.setTextColor(...BODY_T);
+            doc.text(`Avant taxes: ${fmt$(preT)}`, ML + CW - 10, ry, {align:'right'});
+            ry += 10;
+
+            // Total (highlighted)
+            doc.setFillColor(...ACCENT);
+            doc.rect(ML + 3, ry, CW - 6, 18, 'F');
+            doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BRAND);
+            doc.text(anyMulti ? `TOTAL COMBO ${ci+1}` : 'GRAND TOTAL', ML + 10, ry + 12);
+            doc.setFont('helvetica','italic'); doc.setFontSize(7); doc.setTextColor(...BRAND);
+            doc.text('taxes incluses / with taxes', ML + 110, ry + 12);
+            doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(...BRAND);
+            doc.text(fmt$(withTax), ML + CW - 10, ry + 13, {align:'right'});
+            ry += 22;
+
+            y = cy + cardH + 10;
+        });
     }
 
     // ── OPTIONS SUMMARY — client selects one (forced to its own final page) ──
