@@ -272,6 +272,7 @@ let chamferPickState = null; // { s, key, step:1|2, edgeA, edgeB, pt1, pt1Edge, 
 let selectedJoint = null;    // { s, j }
 let draggingJoint = false;
 let draggingJointRef = null; // { s, j }
+let jointSnapCorner = null;  // { x, y } in canvas coords while a joint drag is snapped to an inside corner
 
 // ─────────────────────────────────────────────────────────────
 //  Canvas refs
@@ -1048,10 +1049,20 @@ function nearestEdge(mx, my) {
                 if (d < bestD) { bestD = d; best = { s, key:dk, label:'Chanfrein L'+i, x1:nv.pin[0], y1:nv.pin[1], x2:nv.pout[0], y2:nv.pout[1] }; }
             }
         } else if (s.shapeType === 'u') {
-            const sides = uShapeSides(s);
-            for (const sd of sides) {
-                const d = distToSegment(mx, my, sd.x1, sd.y1, sd.x2, sd.y2);
-                if (d < bestD) { bestD = d; best = { s, key:sd.key, label:sd.label, x1:sd.x1, y1:sd.y1, x2:sd.x2, y2:sd.y2 }; }
+            const uverts = uShapeVerts(s);
+            // Border segments adjusted to corner treatments (like L-shape)
+            for (let i = 0; i < uverts.length; i++) {
+                const v = uverts[i], nv = uverts[(i+1)%uverts.length];
+                const d = distToSegment(mx, my, v.pout[0], v.pout[1], nv.pin[0], nv.pin[1]);
+                if (d < bestD) { bestD = d; best = { s, key:`seg${i}`, label:(U_SIDE_LABELS[s.uOpening||'top']||[])[i]||`U${i}`, x1:v.pout[0], y1:v.pout[1], x2:nv.pin[0], y2:nv.pin[1] }; }
+            }
+            // Chamfer diagonals at each vertex with a chamfer treatment
+            for (let i = 0; i < uverts.length; i++) {
+                const nv = uverts[i];
+                if (nv.t <= 0 || nv.r > 0) continue;
+                const dk = `diag_uc${i}`;
+                const d = distToSegment(mx, my, nv.pin[0], nv.pin[1], nv.pout[0], nv.pout[1]);
+                if (d < bestD) { bestD = d; best = { s, key:dk, label:'Chanfrein U'+i, x1:nv.pin[0], y1:nv.pin[1], x2:nv.pout[0], y2:nv.pout[1] }; }
             }
         } else if (s.shapeType === 'bsp') {
             const sides = bspSides(s);
@@ -1115,15 +1126,19 @@ function nearestCornerForEdge(mx, my) {
             }
             continue;
         }
-        // U-shape: radius via s.corners.uc{i} (rendered via polygon approximation — treated best-effort)
+        // U-shape: pick arc midpoint for radiused vertices (accurate pick point)
         if (s.shapeType === 'u') {
-            const poly = uShapePolygon(s);
-            const n = poly.length;
-            for (let i = 0; i < n; i++) {
-                const rad = (s.corners && s.corners[`uc${i}`]) || 0;
-                if (rad <= 0) continue;
-                const px = poly[i][0], py = poly[i][1];
-                if (Math.hypot(mx - px, my - py) < THRESH) return { s, key: `uc${i}`, px, py };
+            const verts = uShapeVerts(s);
+            for (let i = 0; i < verts.length; i++) {
+                const nv = verts[i];
+                if (!(nv.r > 0)) continue;
+                const midX = (nv.pin[0] + nv.pout[0]) / 2;
+                const midY = (nv.pin[1] + nv.pout[1]) / 2;
+                const dx = midX - nv.curr[0], dy = midY - nv.curr[1];
+                const d = Math.hypot(dx, dy) || 1;
+                const mpx = nv.curr[0] + (dx/d) * nv.r;
+                const mpy = nv.curr[1] + (dy/d) * nv.r;
+                if (Math.hypot(mx - mpx, my - mpy) < THRESH) return { s, key: `uc${i}`, px: mpx, py: mpy };
             }
             continue;
         }
@@ -1144,6 +1159,76 @@ function nearestCornerForEdge(mx, my) {
         }
     }
     return null;
+}
+
+function getInsideCornersForJoint(s) {
+    const out = [];
+
+    // 1. Reflex vertices of the shape's own polygon (L-shape notch, U-shape channel)
+    let poly = null;
+    if (s.shapeType === 'l')      poly = lShapePolygon(s);
+    else if (s.shapeType === 'u') poly = uShapePolygon(s);
+    else if (s.shapeType === 'bsp') poly = bspPolygon(s);
+    if (poly && poly.length >= 4) {
+        const n = poly.length;
+        let totalCross = 0;
+        for (let i = 0; i < n; i++) {
+            const a = poly[i], b = poly[(i+1)%n], c = poly[(i+2)%n];
+            totalCross += (b[0]-a[0])*(c[1]-b[1]) - (b[1]-a[1])*(c[0]-b[0]);
+        }
+        const pos = totalCross > 0;
+        for (let i = 0; i < n; i++) {
+            const a = poly[i], b = poly[(i+1)%n], c = poly[(i+2)%n];
+            const cross = (b[0]-a[0])*(c[1]-b[1]) - (b[1]-a[1])*(c[0]-b[0]);
+            if ((pos && cross < 0) || (!pos && cross > 0)) {
+                out.push({ x: b[0], y: b[1] });
+            }
+        }
+    }
+
+    // 2. Multi-piece layouts: corners of other rect shapes that land on THIS shape's
+    //    boundary (not at a corner of this shape) — the meeting point of two pieces
+    //    is an inside corner of the combined outline.
+    const EPS = 0.5;
+    const onSegBetween = (px, py, x1, y1, x2, y2) => {
+        // Axis-aligned segments only (rectangle edges)
+        if (Math.abs(x1 - x2) < EPS) {
+            // vertical segment
+            if (Math.abs(px - x1) > EPS) return false;
+            return py > Math.min(y1, y2) + EPS && py < Math.max(y1, y2) - EPS;
+        }
+        if (Math.abs(y1 - y2) < EPS) {
+            // horizontal segment
+            if (Math.abs(py - y1) > EPS) return false;
+            return px > Math.min(x1, x2) + EPS && px < Math.max(x1, x2) - EPS;
+        }
+        return false;
+    };
+    const sEdges = (s.shapeType === 'rect' || !s.shapeType)
+        ? [[s.x, s.y, s.x+s.w, s.y], [s.x+s.w, s.y, s.x+s.w, s.y+s.h],
+           [s.x+s.w, s.y+s.h, s.x, s.y+s.h], [s.x, s.y+s.h, s.x, s.y]]
+        : null;
+    if (sEdges) {
+        for (const other of shapes) {
+            if (other === s || other.subtype) continue;
+            if (other.shapeType !== 'rect' && other.shapeType) continue;
+            const corners = [
+                [other.x,           other.y],
+                [other.x + other.w, other.y],
+                [other.x + other.w, other.y + other.h],
+                [other.x,           other.y + other.h],
+            ];
+            for (const [cx, cy] of corners) {
+                for (const [x1, y1, x2, y2] of sEdges) {
+                    if (onSegBetween(cx, cy, x1, y1, x2, y2)) {
+                        out.push({ x: cx, y: cy });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return out;
 }
 
 function hitJoint(mx, my) {
@@ -1906,15 +1991,55 @@ function drawLShape(s, sel) {
     drawFsOutlineLabel(s);
 }
 
-function drawUShape(s, sel) {
+// Per-vertex data for U-shapes, mirroring lShapeVerts. Each of the 8 polygon
+// vertices may carry a radius (s.corners.uc{i}) or chamfer (s.chamfers.uc{i})
+// with an optional asymmetric B-side (s.chamfersB.uc{i}).
+function uShapeVerts(s) {
     const pts = uShapePolygon(s);
-    const fill = sel ? 'rgba(201,168,76,0.12)' : 'rgba(218,230,248,0.88)';
-    ctx.save();
-    ctx.beginPath(); ctx.moveTo(pts[0][0],pts[0][1]);
-    for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0],pts[i][1]);
-    ctx.closePath(); ctx.fillStyle=fill; ctx.fill(); ctx.restore();
+    const n = pts.length;
+    return pts.map((curr, i) => {
+        const prev = pts[(i-1+n)%n], next = pts[(i+1)%n];
+        const key = `uc${i}`;
+        const r   = s.corners?.[key]   || 0;
+        const ch  = s.chamfers?.[key]  || 0;
+        const chb = s.chamfersB?.[key] || 0;
+        const len1 = Math.hypot(curr[0]-prev[0], curr[1]-prev[1]);
+        const len2 = Math.hypot(next[0]-curr[0], next[1]-curr[1]);
+        const tIn  = ch > 0 ? ch  : r;
+        const tOut = ch > 0 ? (chb != null ? chb : ch) : r;
+        const tInC  = Math.min(tIn,  len1);
+        const tOutC = Math.min(tOut, len2);
+        const t = Math.max(tInC, tOutC);
+        const tx1=(curr[0]-prev[0])/(len1||1), ty1=(curr[1]-prev[1])/(len1||1);
+        const tx2=(next[0]-curr[0])/(len2||1), ty2=(next[1]-curr[1])/(len2||1);
+        const pin  = tInC  > 0 ? [curr[0]-tx1*tInC,  curr[1]-ty1*tInC]  : [curr[0], curr[1]];
+        const pout = tOutC > 0 ? [curr[0]+tx2*tOutC, curr[1]+ty2*tOutC] : [curr[0], curr[1]];
+        return { curr, pin, pout, t, r, ch, chb };
+    });
+}
 
-    // Carve out farmhouse sink notch
+function drawUShape(s, sel) {
+    const verts = uShapeVerts(s);
+    const n = verts.length;
+    const fill = sel ? 'rgba(201,168,76,0.12)' : 'rgba(218,230,248,0.88)';
+
+    // 1. Fill with corner treatments
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(verts[0].pout[0], verts[0].pout[1]);
+    for (let i = 0; i < n; i++) {
+        const nv = verts[(i+1)%n];
+        ctx.lineTo(nv.pin[0], nv.pin[1]);
+        if (nv.t > 0) {
+            if (nv.r === 0) ctx.lineTo(nv.pout[0], nv.pout[1]);
+            else ctx.arcTo(nv.curr[0], nv.curr[1], nv.pout[0], nv.pout[1], nv.r);
+        }
+    }
+    ctx.closePath();
+    ctx.fillStyle = fill; ctx.fill();
+    ctx.restore();
+
+    // 1b. Carve out farmhouse sink notch
     if (s.farmSink && s.farmSink.edge === 'seg') {
         const fr = farmSinkRectAbs(s);
         ctx.save();
@@ -1923,14 +2048,88 @@ function drawUShape(s, sel) {
         ctx.restore();
     }
 
-    const sides = uShapeSides(s);
-    for (const sd of sides) {
-        drawPolyEdgeMaybeFS(s, sd, sd.key, sel);
+    // 2. Border — 8 sides with endpoints adjusted for corner treatments
+    const labels = U_SIDE_LABELS[s.uOpening || 'top'];
+    for (let i = 0; i < n; i++) {
+        const v = verts[i], nv = verts[(i+1)%n];
+        const key = `seg${i}`;
+        const sd = { x1: v.pout[0], y1: v.pout[1], x2: nv.pin[0], y2: nv.pin[1], label: labels[i], key };
+        drawPolyEdgeMaybeFS(s, sd, key, sel);
+        // Corner treatment rendering at nv
+        if (nv.t > 0) {
+            if (nv.r === 0) {
+                // Chamfer diagonal — selectable as diag_uc{index}
+                const diagStoreKey = `uc${(i+1)%n}`;
+                const chData = s.chamferEdges?.[diagStoreKey];
+                if (chData?.type === 'segmented' && chData.segments?.length) {
+                    drawSegmentedEdge(ctx, chData, nv.pin[0], nv.pin[1], nv.pout[0], nv.pout[1], sel, diagStoreKey);
+                } else {
+                    const diagEtype = chData?.type || 'none';
+                    drawBorderSegment(ctx, diagEtype, nv.pin[0], nv.pin[1], nv.pout[0], nv.pout[1], sel);
+                    if (diagEtype !== 'none') {
+                        const def = EDGE_DEFS[diagEtype];
+                        if (def?.abbr) {
+                            const dmx=(nv.pin[0]+nv.pout[0])/2, dmy=(nv.pin[1]+nv.pout[1])/2;
+                            const ddx=nv.pout[0]-nv.pin[0], ddy=nv.pout[1]-nv.pin[1], dlen=Math.hypot(ddx,ddy)||1;
+                            const dlx=dmx+(ddy/dlen)*14, dly=dmy+(-ddx/dlen)*14;
+                            ctx.save(); ctx.font='bold 9px Raleway,sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+                            ctx.lineWidth=3; ctx.strokeStyle='rgba(255,255,255,0.85)';
+                            ctx.strokeText(def.abbr,dlx,dly); ctx.fillStyle=def.color; ctx.fillText(def.abbr,dlx,dly); ctx.restore();
+                        }
+                    }
+                }
+            } else {
+                // Radius arc — honor cornerEdges[uc_i].type styling
+                const uckey = `uc${(i+1)%n}`;
+                const ctype = s.cornerEdges?.[uckey]?.type || 'none';
+                ctx.save();
+                if (sel && ctype === 'none') { ctx.strokeStyle = '#5fb8c2'; ctx.lineWidth = 2; ctx.setLineDash([]); }
+                else if (ctype === 'none')   { ctx.strokeStyle = '#222222'; ctx.lineWidth = 0.8; ctx.setLineDash([]); }
+                else if (ctype === 'polished' || ctype === 'pencil') { ctx.strokeStyle = '#dd0000'; ctx.lineWidth = 2.5; ctx.setLineDash([]); }
+                else if (ctype === 'ogee')      { ctx.strokeStyle = '#cc44cc'; ctx.lineWidth = 2.5; ctx.setLineDash([]); }
+                else if (ctype === 'bullnose')  { ctx.strokeStyle = '#0088dd'; ctx.lineWidth = 4;   ctx.setLineDash([]); }
+                else if (ctype === 'halfbull')  { ctx.strokeStyle = '#00aa66'; ctx.lineWidth = 2.5; ctx.setLineDash([]); }
+                else if (ctype === 'bevel')     { ctx.strokeStyle = '#dd8800'; ctx.lineWidth = 2.5; ctx.setLineDash([]); }
+                else if (ctype === 'mitered')   { ctx.strokeStyle = '#7a3000'; ctx.lineWidth = 2;   ctx.setLineDash([4,3]); }
+                else if (ctype === 'special')   { ctx.strokeStyle = '#228B22'; ctx.lineWidth = 2.5; ctx.setLineDash([]); }
+                else if (ctype === 'joint')     { ctx.strokeStyle = '#e0457b'; ctx.lineWidth = 2;   ctx.setLineDash([5,4]); }
+                else if (ctype === 'waterfall') { ctx.strokeStyle = '#006688'; ctx.lineWidth = 2;   ctx.setLineDash([]); }
+                ctx.beginPath(); ctx.moveTo(nv.pin[0],nv.pin[1]);
+                ctx.arcTo(nv.curr[0],nv.curr[1],nv.pout[0],nv.pout[1],nv.r); ctx.stroke();
+                const def = EDGE_DEFS[ctype];
+                if (ctype !== 'none' && def?.abbr) {
+                    const midX = (nv.pin[0] + nv.pout[0]) / 2;
+                    const midY = (nv.pin[1] + nv.pout[1]) / 2;
+                    const odx = midX - nv.curr[0], ody = midY - nv.curr[1];
+                    const od = Math.hypot(odx, ody) || 1;
+                    const arcMx = nv.curr[0] + (odx/od) * nv.r;
+                    const arcMy = nv.curr[1] + (ody/od) * nv.r;
+                    const ox = (odx/od) * 12, oy = (ody/od) * 12;
+                    ctx.setLineDash([]);
+                    ctx.font='bold 9px Raleway,sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+                    ctx.lineWidth=3; ctx.strokeStyle='rgba(255,255,255,0.85)';
+                    ctx.strokeText(def.abbr, arcMx+ox, arcMy+oy);
+                    ctx.fillStyle = def.color; ctx.fillText(def.abbr, arcMx+ox, arcMy+oy);
+                }
+                if (ctype === 'none') {
+                    const lx=nv.curr[0], ly=nv.curr[1];
+                    ctx.font='8px Raleway,sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+                    ctx.lineWidth=3; ctx.strokeStyle='rgba(255,255,255,0.8)';
+                    ctx.strokeText(`R${pxToIn(nv.r)}"`,lx,ly); ctx.fillStyle='#cc4444'; ctx.fillText(`R${pxToIn(nv.r)}"`,lx,ly);
+                }
+                ctx.restore();
+            }
+        }
     }
+
+    // 3. Dimension lines — vertex to vertex
+    const pts = uShapePolygon(s);
     for (let i=0;i<8;i++) {
         const j=(i+1)%8;
         drawDimLine(pts[i][0],pts[i][1],pts[j][0],pts[j][1], Math.hypot(pts[j][0]-pts[i][0],pts[j][1]-pts[i][1]), s.id, `dim_u${i}`);
     }
+
+    // 4. Selection outline
     if (sel) {
         ctx.save(); ctx.strokeStyle='#5fb8c2'; ctx.lineWidth=2; ctx.setLineDash([3,3]);
         ctx.beginPath(); ctx.moveTo(pts[0][0],pts[0][1]);
@@ -2273,12 +2472,18 @@ function drawShape(s, sel) {
 // ─────────────────────────────────────────────────────────────
 function drawJointLines(s) {
     if (!s.joints || s.joints.length === 0) return;
+    // Polygon used for point-in-shape tests when deciding which side of a
+    // snapped corner is inside the shape.
+    const polyForTest = (s.shapeType === 'l') ? lShapePolygon(s)
+                      : (s.shapeType === 'u') ? uShapePolygon(s)
+                      : (s.shapeType === 'bsp') ? bspPolygon(s)
+                      : [[s.x, s.y], [s.x+s.w, s.y], [s.x+s.w, s.y+s.h], [s.x, s.y+s.h]];
     for (const j of s.joints) {
         const isSel = selectedJoint?.j === j;
         ctx.save();
         // Clip joint lines to the actual shape boundary
         if (s.shapeType === 'l' || s.shapeType === 'u' || s.shapeType === 'bsp') {
-            const pts = s.shapeType === 'l' ? lShapePolygon(s) : s.shapeType === 'u' ? uShapePolygon(s) : bspPolygon(s);
+            const pts = polyForTest;
             ctx.beginPath();
             ctx.moveTo(pts[0][0], pts[0][1]);
             for (let i=1; i<pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
@@ -2294,31 +2499,65 @@ function drawJointLines(s) {
 
         if (j.axis === 'v') {
             const jx = s.x + clamp(j.pos, 2, s.w - 2);
-            ctx.beginPath(); ctx.moveTo(jx, s.y + 2); ctx.lineTo(jx, s.y + s.h - 2); ctx.stroke();
+            // Default endpoints span the bounding box; a snapped joint is
+            // anchored at the corner and extends only into the shape so the
+            // wall + joint read as one continuous line (two perfect rectangles
+            // on either side of the cut).
+            let y1 = s.y + 2, y2 = s.y + s.h - 2;
+            if (j.snap) {
+                const cy = s.y + j.snap.relY;
+                // Probe all four quadrants around the corner, OFF the joint
+                // axis, to avoid polygon-boundary ambiguity at x=jx.
+                const t = 3;
+                const upL = pointInPolygon(jx - t, cy - t, polyForTest);
+                const upR = pointInPolygon(jx + t, cy - t, polyForTest);
+                const dnL = pointInPolygon(jx - t, cy + t, polyForTest);
+                const dnR = pointInPolygon(jx + t, cy + t, polyForTest);
+                const upBoth = upL && upR;
+                const dnBoth = dnL && dnR;
+                if (dnBoth && !upBoth) y1 = cy;         // continuation runs DOWN from corner
+                else if (upBoth && !dnBoth) y2 = cy;    // continuation runs UP from corner
+            }
+            ctx.beginPath(); ctx.moveTo(jx, y1); ctx.lineTo(jx, y2); ctx.stroke();
             ctx.setLineDash([]);
-            // Label
+            // Label — placed just inside the visible segment's top end
             ctx.font = 'bold 8px Raleway,sans-serif';
             ctx.textAlign = 'center'; ctx.textBaseline = 'top';
             ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,255,255,0.85)';
-            ctx.strokeText('JT', jx, s.y + 4);
-            ctx.fillStyle = '#e0457b'; ctx.fillText('JT', jx, s.y + 4);
-            // Selection dot
+            const labelY = y1 + 2;
+            ctx.strokeText('JT', jx, labelY);
+            ctx.fillStyle = '#e0457b'; ctx.fillText('JT', jx, labelY);
+            // Selection dot — midpoint of visible segment
             if (isSel) {
-                ctx.beginPath(); ctx.arc(jx, s.y + s.h/2, 5, 0, Math.PI*2);
+                ctx.beginPath(); ctx.arc(jx, (y1 + y2)/2, 5, 0, Math.PI*2);
                 ctx.fillStyle = '#e0457b'; ctx.fill();
                 ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
             }
         } else {
             const jy = s.y + clamp(j.pos, 2, s.h - 2);
-            ctx.beginPath(); ctx.moveTo(s.x + 2, jy); ctx.lineTo(s.x + s.w - 2, jy); ctx.stroke();
+            let x1 = s.x + 2, x2 = s.x + s.w - 2;
+            if (j.snap) {
+                const cx = s.x + j.snap.relX;
+                const t = 3;
+                const upL = pointInPolygon(cx - t, jy - t, polyForTest);
+                const upR = pointInPolygon(cx + t, jy - t, polyForTest);
+                const dnL = pointInPolygon(cx - t, jy + t, polyForTest);
+                const dnR = pointInPolygon(cx + t, jy + t, polyForTest);
+                const leftBoth  = upL && dnL;
+                const rightBoth = upR && dnR;
+                if (rightBoth && !leftBoth) x1 = cx;       // continuation runs RIGHT from corner
+                else if (leftBoth && !rightBoth) x2 = cx;  // continuation runs LEFT from corner
+            }
+            ctx.beginPath(); ctx.moveTo(x1, jy); ctx.lineTo(x2, jy); ctx.stroke();
             ctx.setLineDash([]);
             ctx.font = 'bold 8px Raleway,sans-serif';
             ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
             ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,255,255,0.85)';
-            ctx.strokeText('JT', s.x + 5, jy - 2);
-            ctx.fillStyle = '#e0457b'; ctx.fillText('JT', s.x + 5, jy - 2);
+            const labelX = x1 + 3;
+            ctx.strokeText('JT', labelX, jy - 2);
+            ctx.fillStyle = '#e0457b'; ctx.fillText('JT', labelX, jy - 2);
             if (isSel) {
-                ctx.beginPath(); ctx.arc(s.x + s.w/2, jy, 5, 0, Math.PI*2);
+                ctx.beginPath(); ctx.arc((x1 + x2)/2, jy, 5, 0, Math.PI*2);
                 ctx.fillStyle = '#e0457b'; ctx.fill();
                 ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
             }
@@ -2475,6 +2714,51 @@ function render() {
     drawMeasurements();
     drawProfileDiags();
     drawChamferPickUI();
+    // When the joint tool is active, pulse accent dots on every inside corner
+    // of every shape so the user knows exactly where joints can be placed.
+    if (tool === 'joint') {
+        ctx.save();
+        for (const s of shapes) {
+            if (s.subtype) continue;
+            const corners = getInsideCornersForJoint(s);
+            for (const c of corners) {
+                // Halo
+                ctx.beginPath();
+                ctx.arc(c.x, c.y, 12, 0, Math.PI * 2);
+                ctx.strokeStyle = 'rgba(95,184,194,0.35)';
+                ctx.lineWidth = 2.5;
+                ctx.stroke();
+                // Solid dot
+                ctx.beginPath();
+                ctx.arc(c.x, c.y, 5, 0, Math.PI * 2);
+                ctx.fillStyle = '#5fb8c2';
+                ctx.fill();
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = '#ffffff';
+                ctx.stroke();
+            }
+        }
+        ctx.restore();
+    }
+    // Joint-snap indicator: accent dot + halo when a joint drag is locked to an inside corner
+    if (jointSnapCorner) {
+        ctx.save();
+        // Halo
+        ctx.beginPath();
+        ctx.arc(jointSnapCorner.x, jointSnapCorner.y, 10, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(95,184,194,0.35)';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+        // Solid dot
+        ctx.beginPath();
+        ctx.arc(jointSnapCorner.x, jointSnapCorner.y, 4.5, 0, Math.PI * 2);
+        ctx.fillStyle = '#5fb8c2';
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = '#ffffff';
+        ctx.stroke();
+        ctx.restore();
+    }
     // Update right-panel live sections
     if (typeof updateLiveLegend === 'function') updateLiveLegend();
 }
@@ -2980,13 +3264,32 @@ document.getElementById('joint-btn-h').addEventListener('click', () => {
     document.getElementById('joint-btn-h').classList.add('active');
     document.getElementById('joint-btn-v').classList.remove('active');
 });
-function showJointPopup(shape, pos, cvX, cvY) {
+function showJointPopup(shape, pos, cvX, cvY, isCornerSnap = false) {
     hideAllPopups();
     pendingJointShape = shape;
     pendingJointPos = pos;
     jointOrientation = 'v';
     document.getElementById('joint-btn-v').classList.add('active');
     document.getElementById('joint-btn-h').classList.remove('active');
+    // Dynamic title/hint: corner snap vs free placement
+    const titleEl = document.getElementById('joint-popup-title');
+    const hintEl  = document.getElementById('joint-popup-hint');
+    const btnV    = document.getElementById('joint-btn-v');
+    const btnH    = document.getElementById('joint-btn-h');
+    const okBtn   = document.getElementById('joint-ok');
+    if (isCornerSnap) {
+        if (titleEl) titleEl.textContent = 'Split at Corner';
+        if (hintEl)  hintEl.textContent  = 'Extend a wall from this inside corner across the shape — creates clean rectangles.';
+        if (btnV)    btnV.textContent    = '↕ Continue vertical wall';
+        if (btnH)    btnH.textContent    = '↔ Continue horizontal wall';
+        if (okBtn)   okBtn.textContent   = 'Split';
+    } else {
+        if (titleEl) titleEl.textContent = 'Add Joint Line';
+        if (hintEl)  hintEl.textContent  = 'Place a custom joint line. Drag to reposition after.';
+        if (btnV)    btnV.textContent    = '↕ Vertical';
+        if (btnH)    btnH.textContent    = '↔ Horizontal';
+        if (okBtn)   okBtn.textContent   = 'Add Joint';
+    }
     currentPopup = 'joint';
     const sp = screenPos(cvX, cvY);
     showPopupAt(document.getElementById('joint-popup'), sp.x + 20, sp.y - 20);
@@ -2994,15 +3297,32 @@ function showJointPopup(shape, pos, cvX, cvY) {
 function confirmJointPopup() {
     if (!pendingJointShape || !pendingJointPos) return;
     const s = pendingJointShape, pos = pendingJointPos;
+    // Snap to nearest inside corner on placement so the joint can read as a
+    // continuation of the wall at that corner.
+    const SNAP_THRESH = 10;
+    let snapCorner = null;
+    {
+        const corners = getInsideCornersForJoint(s);
+        let best = SNAP_THRESH;
+        for (const c of corners) {
+            const d = jointOrientation === 'v' ? Math.abs(pos.px - c.x) : Math.abs(pos.py - c.y);
+            if (d < best) { best = d; snapCorner = c; }
+        }
+    }
     let jpos;
-    if (jointOrientation === 'v') {
+    if (snapCorner) {
+        jpos = jointOrientation === 'v' ? (snapCorner.x - s.x) : (snapCorner.y - s.y);
+        jpos = clamp(jpos, INCH*2, jointOrientation === 'v' ? s.w - INCH*2 : s.h - INCH*2);
+    } else if (jointOrientation === 'v') {
         jpos = clamp(snap(pos.px - s.x), INCH*2, s.w - INCH*2);
     } else {
         jpos = clamp(snap(pos.py - s.y), INCH*2, s.h - INCH*2);
     }
     pushUndo();
     if (!s.joints) s.joints = [];
-    s.joints.push({ id: Date.now(), axis: jointOrientation, pos: jpos });
+    const newJoint = { id: Date.now(), axis: jointOrientation, pos: jpos };
+    if (snapCorner) newJoint.snap = { relX: snapCorner.x - s.x, relY: snapCorner.y - s.y };
+    s.joints.push(newJoint);
     persist(); hideAllPopups(); setTool('select'); render();
 }
 document.getElementById('joint-ok').addEventListener('click', confirmJointPopup);
@@ -3803,10 +4123,26 @@ cv.addEventListener('mousedown', e => {
             selectedJoint = jh; draggingJoint = true; draggingJointRef = jh;
             pushUndo(); render(); return;
         }
-        // Add new joint
+        // Look for a nearby inside corner — snap there if found. Otherwise
+        // fall back to free placement on whichever shape was clicked.
+        const CORNER_SNAP_PX = 40;
+        let bestShape = null, bestCorner = null, bestDist = CORNER_SNAP_PX;
+        for (const s of shapes) {
+            if (s.subtype) continue;
+            const corners = getInsideCornersForJoint(s);
+            for (const c of corners) {
+                const d = Math.hypot(p.x - c.x, p.y - c.y);
+                if (d < bestDist) { bestDist = d; bestShape = s; bestCorner = c; }
+            }
+        }
+        if (bestShape && bestCorner) {
+            showJointPopup(bestShape, { px: bestCorner.x, py: bestCorner.y }, bestCorner.x, bestCorner.y, true);
+            return;
+        }
+        // Free placement fallback — original behavior
         const hit = hitShape(p.x, p.y);
         if (hit) {
-            showJointPopup(hit, { px: p.x, py: p.y }, p.x, p.y);
+            showJointPopup(hit, { px: p.x, py: p.y }, p.x, p.y, false);
         }
         return;
     }
@@ -3947,8 +4283,31 @@ cv.addEventListener('mousemove', e => {
 
     if (draggingJoint && draggingJointRef) {
         const { s, j } = draggingJointRef;
-        if (j.axis === 'v') j.pos = clamp(snap(p.x - s.x), INCH, s.w - INCH);
-        else                j.pos = clamp(snap(p.y - s.y), INCH, s.h - INCH);
+        const SNAP_THRESH = 10; // px — magnetic snap zone at inside corners
+        // Find the nearest inside corner along the joint's axis, within threshold
+        const corners = getInsideCornersForJoint(s);
+        let snapped = null;
+        let bestDist = SNAP_THRESH;
+        for (const c of corners) {
+            const relPos = j.axis === 'v' ? (c.x - s.x) : (c.y - s.y);
+            const axisMin = INCH, axisMax = (j.axis === 'v' ? s.w : s.h) - INCH;
+            if (relPos < axisMin || relPos > axisMax) continue;
+            const d = j.axis === 'v' ? Math.abs(p.x - c.x) : Math.abs(p.y - c.y);
+            if (d < bestDist) { bestDist = d; snapped = { corner: c, relPos }; }
+        }
+        if (snapped) {
+            j.pos = snapped.relPos;
+            // Store the corner as shape-relative so the joint follows the shape,
+            // and so drawJointLines can anchor the joint at the corner to form
+            // a continuous line with the wall that ends at the corner.
+            j.snap = { relX: snapped.corner.x - s.x, relY: snapped.corner.y - s.y };
+            jointSnapCorner = snapped.corner;
+        } else {
+            if (j.axis === 'v') j.pos = clamp(snap(p.x - s.x), INCH, s.w - INCH);
+            else                j.pos = clamp(snap(p.y - s.y), INCH, s.h - INCH);
+            delete j.snap;
+            jointSnapCorner = null;
+        }
         render(); return;
     }
 
@@ -4030,7 +4389,7 @@ cv.addEventListener('mouseup', e => {
     const p = mousePos(e);
 
     if (draggingJoint) {
-        draggingJoint = false; draggingJointRef = null; persist(); return;
+        draggingJoint = false; draggingJointRef = null; jointSnapCorner = null; persist(); render(); return;
     }
 
     if ((tool === 'draw' || tool === 'ldraw' || tool === 'udraw' || tool === 'bsp') && drawing) {
@@ -4170,7 +4529,7 @@ document.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
         ghostText = null;
         selected = null; selectedJoint = null; drawing = false; dStart = null; dCur = null;
-        moving = false; resizing = false; edgeResizing = null; draggingJoint = false;
+        moving = false; resizing = false; edgeResizing = null; draggingJoint = false; jointSnapCorner = null;
         hovCorner = null; hovEdge = null; hovCornerEdge = null; chamferPickState = null;
         measurePt1 = null; measureHover = null; selectedMeasure = null;
         render(); updateStatus(); return;
@@ -4230,7 +4589,7 @@ function setTool(t) {
     ghostText = null; // cancel any floating text
     measurePt1 = null; measureHover = null;
     tool = t; selected = null; selectedJoint = null; selectedMeasure = null;
-    drawing = false; moving = false; resizing = false; edgeResizing = null; draggingJoint = false;
+    drawing = false; moving = false; resizing = false; edgeResizing = null; draggingJoint = false; jointSnapCorner = null;
     hovCorner = null; hovEdge = null; hovCornerEdge = null;
     selectedText = null;
     cv.style.cursor = ['draw','ldraw','udraw','bsp','circle','sink','farmsink','cooktop','outlet','bocci','radius','edge','splitedge','joint','measure'].includes(t) ? 'crosshair' : 'default';
@@ -5538,7 +5897,7 @@ function switchPanelTab(active) {
     const ep = document.getElementById('edge-palette');
     if (tb) tb.style.display = active === 'slab' ? 'none' : '';
     if (ep) ep.style.display = active === 'slab' ? 'none' : (tool === 'edge' ? 'flex' : 'none');
-    if (active === 'slab') { syncPageOut(); slabRefreshSlabList(); slabRefreshPieceList(); slabRender(); }
+    if (active === 'slab') { syncPageOut(); slabSyncPlacedRefs(); slabRefreshSlabList(); slabRefreshPieceList(); slabRender(); }
     if (active === 'registry') { regRefresh(); }
 }
 document.getElementById('ptab-layout').addEventListener('click',  () => switchPanelTab('layout'));
@@ -6067,6 +6426,93 @@ function slabPieceInDeadZone(slabIdx, x, y, w, h, ref, rotation) {
     return x < 0 || y < 0 || x + w > usableW || y + h > usableH;
 }
 
+// Decompose an axis-aligned shape into non-overlapping rectangles in shape-local
+// inches. Returns null for shapes that can't be cleanly decomposed (chamfered,
+// rounded, circle, farmSink present, etc.) — those still go through the
+// Sutherland-Hodgman fallback in slabAllPieces.
+function shapeLocalRects(s) {
+    const st = s.shapeType || 'rect';
+    const wi = s.w / INCH, hi = s.h / INCH;
+
+    const r  = shapeRadii(s), ch = shapeChamfers(s);
+    const hasChamfer = ch.nw || ch.ne || ch.se || ch.sw;
+    const hasRadius  = r.nw  || r.ne  || r.se  || r.sw;
+    if (hasChamfer || hasRadius) return null;
+    if (s.farmSink) return null;
+    if (st === 'circle') return null;
+
+    if (st === 'rect' || !st) return [{ x: 0, y: 0, w: wi, h: hi }];
+
+    if (st === 'l') {
+        const nW = (s.notchW || 0) / INCH, nH = (s.notchH || 0) / INCH;
+        const corner = s.notchCorner || 'ne';
+        switch (corner) {
+            case 'ne': return [
+                { x: 0,       y: 0,  w: wi - nW, h: hi },
+                { x: wi - nW, y: nH, w: nW,      h: hi - nH },
+            ];
+            case 'nw': return [
+                { x: nW,      y: 0,  w: wi - nW, h: hi },
+                { x: 0,       y: nH, w: nW,      h: hi - nH },
+            ];
+            case 'se': return [
+                { x: 0,       y: 0,  w: wi - nW, h: hi },
+                { x: wi - nW, y: 0,  w: nW,      h: hi - nH },
+            ];
+            case 'sw': return [
+                { x: nW,      y: 0,  w: wi - nW, h: hi },
+                { x: 0,       y: 0,  w: nW,      h: hi - nH },
+            ];
+        }
+    }
+
+    if (st === 'u') {
+        const op = s.uOpening || 'top';
+        const isVert = (op === 'top' || op === 'bottom');
+        const A = isVert ? wi : hi;
+        const H = isVert ? hi : wi;
+        const lH = (s.leftH  ?? s.h) / INCH;
+        const rH = (s.rightH ?? s.h) / INCH;
+        const lW = (s.leftW  || 0)   / INCH;
+        const rW = (s.rightW || 0)   / INCH;
+        let fH;
+        if (s.floorH != null)        fH = s.floorH   / INCH;
+        else if (s.channelH != null) fH = H - s.channelH / INCH;
+        else                          fH = 0;
+
+        const floorY     = H - fH;
+        const leftTopY   = H - lH;
+        const rightTopY  = H - rH;
+
+        // Canonical 'top' opening rects in (A, H) coords
+        const canonical = [
+            { x: 0,        y: leftTopY,  w: lW, h: lH },  // left arm
+            { x: 0,        y: floorY,    w: A,  h: fH },  // bottom floor
+            { x: A - rW,   y: rightTopY, w: rW, h: rH },  // right arm
+        ].filter(rc => rc.w > 0 && rc.h > 0);
+
+        const transform = p => {
+            if (op === 'top')    return p;
+            if (op === 'bottom') return { x: A - p.x - p.w, y: H - p.y - p.h, w: p.w, h: p.h };
+            if (op === 'right')  return { x: H - p.y - p.h, y: p.x,           w: p.h, h: p.w };
+            if (op === 'left')   return { x: p.y,           y: A - p.x - p.w, w: p.h, h: p.w };
+            return p;
+        };
+        return canonical.map(transform);
+    }
+
+    if (st === 'bsp') {
+        const pX = (s.pX !== undefined ? s.pX : Math.round((s.w - s.pW) / 2)) / INCH;
+        const pW = s.pW / INCH, pH = s.pH / INCH;
+        return [
+            { x: pX, y: 0,  w: pW, h: pH },         // protrusion
+            { x: 0,  y: pH, w: wi, h: hi - pH },    // main body
+        ].filter(rc => rc.w > 0 && rc.h > 0);
+    }
+
+    return null;
+}
+
 function slabAllPieces() {
     // Returns piece entries for all placeable shapes/segments in the quote.
     // Shapes with joints are split into individual segment entries.
@@ -6097,6 +6543,41 @@ function slabAllPieces() {
             const hCuts = hJoints.length > 0 ? [0, ...hJoints, hi] : [0, hi];
             let segCount = 0;
 
+            // ── Rect-decomposition clipping ──────────────────────────
+            // For axis-aligned shapes, decompose into rectangles first, then
+            // intersect each rect with each joint grid cell. Guarantees clean
+            // rectangular pieces — avoids the Sutherland-Hodgman boundary
+            // degeneracy that produced sliver pieces when the joint aligned
+            // with an inside corner (e.g. L-shape notch).
+            const decompRects = shapeLocalRects(s);
+            if (decompRects) {
+                for (let vi = 0; vi < vCuts.length - 1; vi++) {
+                    for (let hj = 0; hj < hCuts.length - 1; hj++) {
+                        for (const rc of decompRects) {
+                            const xLo = Math.max(rc.x,          vCuts[vi]);
+                            const xHi = Math.min(rc.x + rc.w,   vCuts[vi+1]);
+                            const yLo = Math.max(rc.y,          hCuts[hj]);
+                            const yHi = Math.min(rc.y + rc.h,   hCuts[hj+1]);
+                            const w = xHi - xLo, h = yHi - yLo;
+                            if (w <= 1e-4 || h <= 1e-4) continue;
+                            out.push({
+                                pageIdx: pi, shapeIdx: si,
+                                label: `${baseLabel}-${SEG_LETTERS[segCount]||segCount+1}`,
+                                pageLabel,
+                                wi: +w.toFixed(6), hi: +h.toFixed(6),
+                                shapeType: 'rect', segIdx: segCount,
+                                segOffset: { fromX: xLo, fromY: yLo, toX: xHi, toY: yHi },
+                                segPoly: null
+                            });
+                            segCount++;
+                        }
+                    }
+                }
+                return;
+            }
+
+            // ── Fallback: Sutherland-Hodgman for shapes we can't decompose
+            //    (chamfered, rounded, circle, farmSink, etc.)
             for (let vi = 0; vi < vCuts.length - 1; vi++) {
                 for (let hj = 0; hj < hCuts.length - 1; hj++) {
                     const xLo = vCuts[vi], xHi = vCuts[vi+1];
@@ -6129,8 +6610,32 @@ function slabAllPieces() {
     return out;
 }
 
+// Replace each placed piece's stored ref with the current definition from
+// slabAllPieces(). Called whenever the slab panel is activated or the piece
+// list is refreshed, so placed pieces always reflect the latest joint/shape
+// state (fixes stale segPoly/wi/hi from older placements).
+function slabSyncPlacedRefs() {
+    const pieces = slabAllPieces();
+    let changed = false;
+    for (const pl of slabPlaced) {
+        if (!pl.ref) continue;
+        const match = pieces.find(p =>
+            p.pageIdx  === pl.ref.pageIdx  &&
+            p.shapeIdx === pl.ref.shapeIdx &&
+            ((p.segIdx == null && pl.ref.segIdx == null) ||
+             p.segIdx === pl.ref.segIdx)
+        );
+        if (match) {
+            pl.ref = { ...match };
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 // ── slab panel UI refresh ─────────────────────────────────────────────
 function slabRefreshPieceList() {
+    slabSyncPlacedRefs();
     const div = document.getElementById('slab-piece-list');
     if (!div) return;
     const pieces = slabAllPieces();
@@ -6453,10 +6958,27 @@ function slabDrawSlab(ctx, sd, idx, ox, oy, sc, mockupMode) {
                 }
                 ctx.closePath();
             } else if (shapeType === 'u' && shape && p.ref.segIdx == null) {
-                const pts = uShapePolygon(shape);
-                const first = convAbs(pts[0]);
-                ctx.moveTo(first[0], first[1]);
-                for (let i = 1; i < pts.length; i++) { const pt = convAbs(pts[i]); ctx.lineTo(pt[0], pt[1]); }
+                // Mirror L-shape: use vertex data with corner treatments so
+                // radius arcs and chamfers render on the slab layout.
+                const verts = uShapeVerts(shape);
+                const n = verts.length;
+                const v0p = convAbs(verts[0].pout);
+                ctx.moveTo(v0p[0], v0p[1]);
+                for (let i = 0; i < n; i++) {
+                    const nv = verts[(i+1)%n];
+                    const pinC = convAbs(nv.pin);
+                    ctx.lineTo(pinC[0], pinC[1]);
+                    if (nv.t > 0) {
+                        if (nv.r === 0) {
+                            const poutC = convAbs(nv.pout);
+                            ctx.lineTo(poutC[0], poutC[1]);
+                        } else {
+                            const currC = convAbs(nv.curr);
+                            const poutC = convAbs(nv.pout);
+                            ctx.arcTo(currC[0], currC[1], poutC[0], poutC[1], nv.r / INCH * sc);
+                        }
+                    }
+                }
                 ctx.closePath();
             } else if (shapeType === 'bsp' && shape && p.ref.segIdx == null) {
                 const pts = bspPolygon(shape);
@@ -7358,12 +7880,30 @@ function generateProposal() {
     // Collect per-page pricing for the final summary
     const pagePricings = [];
 
+    // Project-level fees (install + measurements + polissage) are allocated into
+    // each page proportionally by sqft so they appear up-front in the room breakdown.
+    const projectFees    = calcProjectFees();
+    const projectTotSqft = pages.reduce((s, p) => s + calcPageSqft(p), 0);
+    function feeShareForPage(roomSqft) {
+        if (projectTotSqft <= 0 || roomSqft <= 0) return { install: 0, meas: 0, pol: 0, total: 0 };
+        const r = roomSqft / projectTotSqft;
+        const install = projectFees.installCost * r;
+        const meas    = projectFees.measCost    * r;
+        const pol     = projectFees.polCost     * r;
+        return { install, meas, pol, total: install + meas + pol };
+    }
+
     for (let pi=0; pi<pages.length; pi++) {
         const page = pages[pi];
         currentPageIdx = pi; syncPageIn(); render();
 
         const { dataURL: imgData, w: natW, h: natH } = croppedCanvasData(page);
         const pp = calcPagePricing(page);
+        // Allocate project-level fees into this page and roll them into the subtotal
+        const feeShare = feeShareForPage(pp.roomSqft);
+        pp.feeShare    = feeShare;
+        pp.servicesCost += feeShare.total;
+        pp.pageSubtotal += feeShare.total;
         pagePricings.push(pp);
         const { roomSqft, pageMat, edgeFootage, sinks } = pp;
         const contentH = panelContentH(pp);
@@ -7498,12 +8038,15 @@ function generateProposal() {
         }
 
         // ── Page subtotal box (highlighted) ──
+        // Note: pp.servicesCost and pp.pageSubtotal already include this page's
+        // sqft-proportional share of install / measurements / polissage.
+        const hasFees = (pp.feeShare && pp.feeShare.total > 0);
         doc.setFillColor(...ACCENT);
         doc.rect(px+3, py2, pw-6, 20, 'F');
         doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(...BRAND);
         doc.text('SOUS-TOTAL', px+7, py2+9);
         doc.setFont('helvetica','italic'); doc.setFontSize(5.5); doc.setTextColor(...BRAND);
-        doc.text('subtotal (before tax)', px+7, py2+16);
+        doc.text(hasFees ? 'pre-tax · incl. install + mesures' : 'subtotal (before tax)', px+7, py2+16);
         doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...BRAND);
         doc.text(fmt$(pp.pageSubtotal), px+pw-7, py2+14, {align:'right'});
         py2 += 24;
@@ -7522,18 +8065,20 @@ function generateProposal() {
     const hasOptions = __preOptsum.options.length > 0;
     if (!hasOptions && pagePricings.length > 0) {
         const TAX = 1.14975;
-        const fees = calcProjectFees();
+        // Each page subtotal already includes its share of install + measurements + polissage,
+        // so the project total is just the sum of page subtotals.
         const pagesSubtotal = pagePricings.reduce((s, pp) => s + pp.pageSubtotal, 0);
-        const preT = pagesSubtotal + fees.total;
+        const preT = pagesSubtotal;
         const withTax = preT * TAX;
 
         // Room for the summary block (force new page if needed)
-        const needH = 60 + pagePricings.length * 14 + 14 * 4 + 30;
+        const needH = 60 + pagePricings.length * 14 + 14 * 2 + 30;
         if (y + needH > PH - FOOTER_H - 10) newPdfPage();
 
         sectionHead('SOMMAIRE DU PROJET / PROJECT SUMMARY');
 
-        // Per-page rows
+        // Per-page rows — each subtotal already includes installation, measurements
+        // and polissage allocated by sqft.
         doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
         for (const pp of pagePricings) {
             checkY(13);
@@ -7552,58 +8097,16 @@ function generateProposal() {
         doc.setDrawColor(...ACCENT); doc.setLineWidth(0.4);
         doc.line(ML, y, PW - MR, y);
         y += 11;
-        doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(80,68,30);
-        doc.text('Sous-total des pages / Pages subtotal', ML + 6, y);
-        doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...BODY_T);
-        doc.text(fmt$(pagesSubtotal), PW - MR - 6, y, {align:'right'});
-        y += 16;
 
-        // Project-level fees
-        if (fees.installCost > 0 || fees.measCost > 0 || fees.polCost > 0) {
-            doc.setFont('helvetica','bold'); doc.setFontSize(8); doc.setTextColor(...BRAND);
-            doc.text('FRAIS DE PROJET / PROJECT FEES', ML + 6, y);
-            y += 11;
-            doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
-            if (fees.installCost > 0) {
-                checkY(13);
-                const lbl = fees.installMinApplied
-                    ? `Installation (${fees.totalSqft.toFixed(1)} sqft — minimum applied)`
-                    : `Installation (${fees.totalSqft.toFixed(1)} sqft × ${fmt$(fees.installRate)})`;
-                doc.text(lbl, ML + 6, y);
-                doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
-                doc.text(fmt$(fees.installCost), PW - MR - 6, y, {align:'right'});
-                doc.setFont('helvetica','normal');
-                y += 13;
-            }
-            if (fees.measCost > 0) {
-                checkY(13);
-                doc.text('Measurements (flat fee)', ML + 6, y);
-                doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
-                doc.text(fmt$(fees.measCost), PW - MR - 6, y, {align:'right'});
-                doc.setFont('helvetica','normal');
-                y += 13;
-            }
-            if (fees.polCost > 0) {
-                checkY(13);
-                doc.text(`Polissage sous morceau × ${fees.polQty}`, ML + 6, y);
-                doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...BODY_T);
-                doc.text(fmt$(fees.polCost), PW - MR - 6, y, {align:'right'});
-                doc.setFont('helvetica','normal');
-                y += 13;
-            }
-            y += 2;
-            doc.setDrawColor(...ACCENT); doc.setLineWidth(0.4);
-            doc.line(ML, y, PW - MR, y);
-            y += 11;
-        }
-
-        // Pre-tax total
+        // Pre-tax total (install + measurements already included in page subtotals)
         checkY(20);
         doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(80,68,30);
         doc.text('Total avant taxes / Subtotal before tax', ML + 6, y);
+        doc.setFont('helvetica','italic'); doc.setFontSize(7); doc.setTextColor(120,100,50);
+        doc.text('install + mesures inclus', ML + 6, y + 9);
         doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(...BODY_T);
         doc.text(fmt$(preT), PW - MR - 6, y, {align:'right'});
-        y += 16;
+        y += 22;
 
         // Grand total with tax (highlighted)
         checkY(36);
@@ -8858,8 +9361,9 @@ function kitBuildPath(ctx, p, px, py, sc, rotOverride) {
         for(let i=0;i<n;i++){const nv=verts[(i+1)%n],pin=convAbs(nv.pin);ctx.lineTo(pin[0],pin[1]);if(nv.t>0){if(nv.r===0){const po=convAbs(nv.pout);ctx.lineTo(po[0],po[1]);}else{const cu=convAbs(nv.curr),po=convAbs(nv.pout);ctx.arcTo(cu[0],cu[1],po[0],po[1],nv.r/INCH*sc);}}}
         ctx.closePath();
     } else if (st==='u'&&shape&&p.ref.segIdx==null) {
-        const pts=uShapePolygon(shape),f=convAbs(pts[0]);ctx.moveTo(f[0],f[1]);
-        for(let i=1;i<pts.length;i++){const pt=convAbs(pts[i]);ctx.lineTo(pt[0],pt[1]);}
+        const verts=uShapeVerts(shape),n=verts.length;
+        const v0=convAbs(verts[0].pout); ctx.moveTo(v0[0],v0[1]);
+        for(let i=0;i<n;i++){const nv=verts[(i+1)%n],pin=convAbs(nv.pin);ctx.lineTo(pin[0],pin[1]);if(nv.t>0){if(nv.r===0){const po=convAbs(nv.pout);ctx.lineTo(po[0],po[1]);}else{const cu=convAbs(nv.curr),po=convAbs(nv.pout);ctx.arcTo(cu[0],cu[1],po[0],po[1],nv.r/INCH*sc);}}}
         ctx.closePath();
     } else if (st==='bsp'&&shape&&p.ref.segIdx==null) {
         const pts=bspPolygon(shape),f=convAbs(pts[0]);ctx.moveTo(f[0],f[1]);
