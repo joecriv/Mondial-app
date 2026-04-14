@@ -24,24 +24,25 @@ function scheduleSyncToRemote() {
 
 async function _syncAllToRemote() {
     if (!currentUserId) return;
-    // Sync localStorage to user_data (session backup)
     for (const key of SYNC_KEYS) {
         const raw = localStorage.getItem(key);
         if (raw) {
             try {
-                await _sb.from('user_data').upsert({
+                const { error } = await _sb.from('user_data').upsert({
                     clerk_user_id: currentUserId,
                     shop_id: currentShopId,
                     storage_key: key,
                     data: JSON.parse(raw),
                     updated_at: new Date().toISOString()
                 }, { onConflict: 'clerk_user_id,storage_key' });
-            } catch (e) { /* non-fatal */ }
+                if (error) console.warn('user_data sync failed for', key, error);
+            } catch (e) { console.warn('user_data sync threw for', key, e); }
         }
     }
-    // Also auto-save to the current quote row if one is open
+    // saveQuoteToDb now surfaces its own error banner + downloads a JSON
+    // backup on failure — no more silent swallow.
     if (currentQuoteId) {
-        try { await saveQuoteToDb(); } catch (e) { /* non-fatal */ }
+        await saveQuoteToDb();
     }
 }
 
@@ -6149,9 +6150,61 @@ let regQuotes = [];         // cached list of quotes from Supabase
 let regFilterStatus = 'all';
 let regSearchTerm = '';
 
-// Save current state as a quote to Supabase
+// Client-side UUID generator — every quote gets a STABLE id, making saves
+// idempotent: if the row doesn't exist we can recreate it under the same id.
+function _uuidv4() {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+    });
+}
+
+// ── Save-status indicator (top-right toast) ────────────────────────
+let _saveStatusEl = null;
+function _ensureSaveStatusEl() {
+    if (_saveStatusEl) return _saveStatusEl;
+    const el = document.createElement('div');
+    el.id = 'save-status-toast';
+    el.style.cssText = 'position:fixed;top:10px;right:14px;z-index:10001;font:600 11px Raleway,sans-serif;padding:6px 10px;border-radius:4px;pointer-events:auto;box-shadow:0 2px 8px rgba(0,0,0,0.4);display:none;max-width:320px';
+    document.body.appendChild(el);
+    _saveStatusEl = el;
+    return el;
+}
+function setSaveStatus(state, extra) {
+    const el = _ensureSaveStatusEl();
+    el.style.display = '';
+    if (state === 'saving') {
+        el.style.background = '#2a2a2a';
+        el.style.color = '#5fb8c2';
+        el.style.border = '1px solid #5fb8c2';
+        el.innerHTML = '⟳ Saving…';
+    } else if (state === 'saved') {
+        el.style.background = '#1f2a0f';
+        el.style.color = '#b5d070';
+        el.style.border = '1px solid #3a5020';
+        const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        el.innerHTML = `✓ Saved · ${ts}`;
+        setTimeout(() => { if (_saveStatusEl && el.innerHTML.startsWith('✓')) el.style.display = 'none'; }, 4000);
+    } else if (state === 'failed') {
+        el.style.background = '#3a1a1a';
+        el.style.color = '#ff8888';
+        el.style.border = '1px solid #aa3030';
+        const msg = (extra || 'unknown error').toString().slice(0, 120);
+        el.innerHTML = `⚠ Save failed — <span style="text-decoration:underline;cursor:pointer" onclick="saveQuoteToDb().then(r=>{if(r.ok)setSaveStatus('saved')})">retry</span><div style="font-weight:400;font-size:9px;margin-top:3px;color:#faa">${msg}</div>`;
+    } else {
+        el.style.display = 'none';
+    }
+}
+
+// Save current state as a quote to Supabase.
+// Returns { ok: true, id } on success, { ok: false, error } on failure.
+// Self-healing: if the target row is missing (deleted or never inserted),
+// the save is converted from UPDATE to INSERT so the quote always lands.
 async function saveQuoteToDb() {
-    if (!currentShopId || !currentUserId) return;
+    if (!currentShopId || !currentUserId) return { ok: false, error: 'Not signed in' };
+    setSaveStatus('saving');
     saveForm();
     syncPageOut();
     const qData = {
@@ -6161,7 +6214,14 @@ async function saveQuoteToDb() {
     };
     const fData = { ...formData };
     const pData = { ...pricingData };
+
+    if (!currentQuoteId) {
+        currentQuoteId = _uuidv4();
+        localStorage.setItem('mondial_currentQuoteId', currentQuoteId);
+    }
+
     const row = {
+        id: currentQuoteId,
         shop_id: currentShopId,
         created_by: currentUserId,
         created_by_email: currentUserEmail || '',
@@ -6174,25 +6234,34 @@ async function saveQuoteToDb() {
         pricing_data: pData,
         updated_at: new Date().toISOString()
     };
-    if (currentQuoteId) {
-        // Update existing
-        await _sb.from('quotes').update(row).eq('id', currentQuoteId);
-    } else {
-        // Insert new
+
+    try {
+        const upd = await _sb.from('quotes').update(row).eq('id', currentQuoteId).select('id');
+        if (upd.error) throw upd.error;
+        if (upd.data && upd.data.length > 0) {
+            setSaveStatus('saved');
+            regUpdateCurrentBanner();
+            return { ok: true, id: currentQuoteId };
+        }
         row.status = 'draft';
-        const { data } = await _sb.from('quotes').insert(row).select('id').single();
-        if (data) currentQuoteId = data.id;
+        const ins = await _sb.from('quotes').insert(row).select('id').single();
+        if (ins.error) throw ins.error;
+        setSaveStatus('saved');
+        regUpdateCurrentBanner();
+        return { ok: true, id: currentQuoteId, restored: true };
+    } catch (err) {
+        console.error('saveQuoteToDb failed:', err);
+        setSaveStatus('failed', err.message || err.code || String(err));
+        try { _downloadQuoteJson(); } catch (_) {}
+        return { ok: false, error: err.message || String(err) };
     }
-    // Persist current quote ID so it survives page reload
-    if (currentQuoteId) localStorage.setItem('mondial_currentQuoteId', currentQuoteId);
-    else localStorage.removeItem('mondial_currentQuoteId');
-    regUpdateCurrentBanner();
 }
 
 // Load a quote from Supabase into the app
 async function loadQuoteFromDb(quoteId) {
-    const { data: q } = await _sb.from('quotes').select('*').eq('id', quoteId).single();
-    if (!q) { alert('Quote not found.'); return; }
+    const { data: q, error: loadErr } = await _sb.from('quotes').select('*').eq('id', quoteId).maybeSingle();
+    if (loadErr) { alert('Failed to load quote: ' + (loadErr.message || loadErr)); return; }
+    if (!q) { alert('Quote not found — it may have been deleted.'); return; }
     // Restore quote data
     if (q.quote_data) {
         const d = q.quote_data;
@@ -6289,15 +6358,20 @@ function regRenderList() {
 }
 
 async function regSetStatus(quoteId, status) {
-    await _sb.from('quotes').update({ status, updated_at: new Date().toISOString() }).eq('id', quoteId);
+    const { error } = await _sb.from('quotes').update({ status, updated_at: new Date().toISOString() }).eq('id', quoteId);
+    if (error) { alert('Failed to update status: ' + (error.message || error)); return; }
     const q = regQuotes.find(q => q.id === quoteId);
     if (q) q.status = status;
     regRenderList();
 }
 
 async function regDeleteQuote(quoteId) {
-    if (!confirm('Delete this quote permanently?')) return;
-    await _sb.from('quotes').delete().eq('id', quoteId);
+    const q = regQuotes.find(x => x.id === quoteId);
+    const label = q ? `"${q.client_name || q.job_name || q.order_number || '(no name)'}"` : 'this quote';
+    if (!confirm(`Delete ${label} permanently?\n\nThis cannot be undone.`)) return;
+    if (!confirm(`Are you SURE? ${label} will be gone forever.`)) return;
+    const { error } = await _sb.from('quotes').delete().eq('id', quoteId);
+    if (error) { alert('Failed to delete: ' + (error.message || error)); return; }
     if (currentQuoteId === quoteId) { currentQuoteId = null; localStorage.removeItem('mondial_currentQuoteId'); }
     regQuotes = regQuotes.filter(q => q.id !== quoteId);
     regRenderList();
@@ -6333,9 +6407,14 @@ document.querySelectorAll('.reg-filter-btn').forEach(btn => {
     });
 });
 document.getElementById('reg-refresh-btn').addEventListener('click', regRefresh);
-document.getElementById('reg-new-btn').addEventListener('click', () => {
+document.getElementById('reg-new-btn').addEventListener('click', async () => {
     if (currentQuoteId && !confirm('Start a new quote? Current work will be saved first.')) return;
-    if (currentQuoteId) saveQuoteToDb();
+    if (currentQuoteId) {
+        const r = await saveQuoteToDb();
+        if (!r || !r.ok) {
+            if (!confirm('Save failed (a JSON backup was downloaded). Continue starting a new quote anyway? Your current work may be lost.')) return;
+        }
+    }
     // Reset to blank
     currentQuoteId = null;
     localStorage.removeItem('mondial_currentQuoteId');
@@ -8635,17 +8714,15 @@ function quoteFilename(ext) {
 }
 
 // ── Save Quote ────────────────────────────────────────────────
-function saveQuote() {
+async function saveQuote() {
     syncPageOut();
-    // Save to Supabase (cloud)
-    saveQuoteToDb().then(() => {
-        alert('Quote saved to database.');
-        regUpdateCurrentBanner();
-    }).catch(e => {
-        alert('Cloud save failed: ' + e.message + '\nDownloading local backup.');
-        // Fallback: download JSON
-        _downloadQuoteJson();
-    });
+    const r = await saveQuoteToDb();
+    regUpdateCurrentBanner();
+    if (r && r.ok) {
+        if (r.restored) alert('Quote row was missing — recreated under the same id. A backup copy is safe.');
+    } else {
+        alert('Cloud save failed: ' + ((r && r.error) || 'unknown') + '\nA JSON backup was downloaded to keep your work safe.');
+    }
 }
 function _downloadQuoteJson() {
     syncPageOut();
