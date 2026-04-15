@@ -6221,6 +6221,10 @@ async function saveQuoteToDb() {
     const fData = { ...formData };
     const pData = { ...pricingData };
 
+    // Track whether the id was pre-existing so we can distinguish first-save
+    // of a brand-new quote (no UPDATE attempt needed) from a self-heal INSERT
+    // after the row went missing.
+    const hadExistingId = !!currentQuoteId;
     if (!currentQuoteId) {
         currentQuoteId = _uuidv4();
         localStorage.setItem('mondial_currentQuoteId', currentQuoteId);
@@ -6242,19 +6246,21 @@ async function saveQuoteToDb() {
     };
 
     try {
-        const upd = await _sb.from('quotes').update(row).eq('id', currentQuoteId).select('id');
-        if (upd.error) throw upd.error;
-        if (upd.data && upd.data.length > 0) {
-            setSaveStatus('saved');
-            regUpdateCurrentBanner();
-            return { ok: true, id: currentQuoteId };
+        if (hadExistingId) {
+            const upd = await _sb.from('quotes').update(row).eq('id', currentQuoteId).select('id');
+            if (upd.error) throw upd.error;
+            if (upd.data && upd.data.length > 0) {
+                setSaveStatus('saved');
+                regUpdateCurrentBanner();
+                return { ok: true, id: currentQuoteId };
+            }
         }
         row.status = 'draft';
         const ins = await _sb.from('quotes').insert(row).select('id').single();
         if (ins.error) throw ins.error;
         setSaveStatus('saved');
         regUpdateCurrentBanner();
-        return { ok: true, id: currentQuoteId, restored: true };
+        return { ok: true, id: currentQuoteId, restored: hadExistingId };
     } catch (err) {
         console.error('saveQuoteToDb failed:', err);
         setSaveStatus('failed', err.message || err.code || String(err));
