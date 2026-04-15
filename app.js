@@ -24,6 +24,11 @@ function scheduleSyncToRemote() {
 
 async function _syncAllToRemote() {
     if (!currentUserId) return;
+    // Snapshot the quote id at the START of the auto-sync. If New Quote
+    // resets currentQuoteId to null while we're awaiting user_data upserts,
+    // we DON'T want the post-loop check to see a stale id and clobber
+    // the row with empty form data.
+    const snapshotQuoteId = currentQuoteId;
     for (const key of SYNC_KEYS) {
         const raw = localStorage.getItem(key);
         if (raw) {
@@ -39,10 +44,10 @@ async function _syncAllToRemote() {
             } catch (e) { console.warn('user_data sync threw for', key, e); }
         }
     }
-    // saveQuoteToDb now surfaces its own error banner + downloads a JSON
-    // backup on failure — no more silent swallow.
-    if (currentQuoteId) {
+    if (snapshotQuoteId && snapshotQuoteId === currentQuoteId) {
         await saveQuoteToDb();
+    } else if (snapshotQuoteId && !currentQuoteId) {
+        console.warn('[autoSync] skipping quote save — currentQuoteId was reset mid-sync', snapshotQuoteId);
     }
 }
 
@@ -6220,6 +6225,28 @@ async function saveQuoteToDb() {
     };
     const fData = { ...formData };
     const pData = { ...pricingData };
+
+    // Diagnostic — surface what's actually being saved + a stack trace so we
+    // can identify which code path triggered this save.
+    console.log('[saveQuoteToDb]', {
+        formData_client: formData.client,
+        formData_order:  formData.order,
+        formData_job:    formData.job,
+        dom_client: (document.getElementById('f-client') || {}).value,
+        dom_order:  (document.getElementById('f-order')  || {}).value,
+        dom_job:    (document.getElementById('f-job')    || {}).value,
+        shapeCount: pages.reduce((n, p) => n + (p.shapes||[]).length, 0),
+        currentQuoteId,
+    });
+
+    // GUARDRAIL — refuse to UPDATE an existing row with completely empty data.
+    const _isEmpty = !formData.client && !formData.order && !formData.job;
+    const _hasShapes = pages.some(p => (p.shapes||[]).length > 0);
+    if (currentQuoteId && _isEmpty && !_hasShapes) {
+        console.warn('[saveQuoteToDb] REFUSED — would clobber existing row', currentQuoteId, 'with empty data');
+        setSaveStatus('saved');
+        return { ok: true, id: currentQuoteId, skipped: true };
+    }
 
     // Track whether the id was pre-existing so we can distinguish first-save
     // of a brand-new quote (no UPDATE attempt needed) from a self-heal INSERT
