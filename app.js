@@ -9153,6 +9153,11 @@ document.getElementById('load-file-input').addEventListener('change', function(e
 // ── New Quote ─────────────────────────────────────────────────
 function newQuote() {
     if (!confirm('Start a new quote? All current canvas and form data will be cleared.')) return;
+    console.log('[newQuote] resetting — was editing:', currentQuoteId);
+    // CRITICAL: clear the quote-id pointer FIRST. Without this, the next save
+    // would UPDATE the previous quote row instead of creating a new one.
+    currentQuoteId = null;
+    localStorage.removeItem('mondial_currentQuoteId');
     pages = [{ id:1, name:'Page 1', shapes:[], textItems:[], nextId:1, _undo:[] }];
     currentPageIdx = 0; _nextPageId = 2;
     syncPageIn();
@@ -9177,6 +9182,8 @@ function newQuote() {
     selected = null; selectedJoint = null; selectedText = null;
     renderPageTabs();
     render(); updateStatus();
+    regUpdateCurrentBanner();
+    console.log('[newQuote] done — currentQuoteId:', currentQuoteId);
 }
 
 // ── Export PDF ────────────────────────────────────────────────
