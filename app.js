@@ -29,6 +29,7 @@ async function _syncAllToRemote() {
     // we DON'T want the post-loop check to see a stale id and clobber
     // the row with empty form data.
     const snapshotQuoteId = currentQuoteId;
+    // Sync localStorage to user_data (session backup)
     for (const key of SYNC_KEYS) {
         const raw = localStorage.getItem(key);
         if (raw) {
@@ -44,6 +45,11 @@ async function _syncAllToRemote() {
             } catch (e) { console.warn('user_data sync threw for', key, e); }
         }
     }
+    // Auto-save to the current quote row only if BOTH the snapshot id from
+    // the start of this sync AND the current id (which may have been reset
+    // mid-loop) are still set and equal. Prevents the race where reset
+    // happens during user_data upserts and the post-loop check still sees
+    // the old id.
     if (snapshotQuoteId && snapshotQuoteId === currentQuoteId) {
         await saveQuoteToDb();
     } else if (snapshotQuoteId && !currentQuoteId) {
@@ -184,16 +190,13 @@ async function checkSeatAndRegister(clerkUserId, email) {
 const LOGO_DATA_URL = (() => {
     const c = document.createElement('canvas'); c.width = 360; c.height = 140;
     const x = c.getContext('2d');
-    // Mondial slate blue-grey background
     x.fillStyle = '#3d5a68';
     x.fillRect(0, 0, 360, 140);
-    // White company name
     x.fillStyle = '#ffffff';
     x.font = '700 48px Raleway, Helvetica, Arial, sans-serif';
     x.letterSpacing = '6px';
     x.textAlign = 'center'; x.textBaseline = 'middle';
     x.fillText('MONDIAL', 180, 55);
-    // Teal diamond + "entrepôt" + yellow diamond + "boutique"
     x.font = '400 14px Raleway, Helvetica, Arial, sans-serif';
     x.letterSpacing = '2px';
     x.fillStyle = '#5fb8c2';
@@ -361,6 +364,7 @@ function normalizeShape(s) {
         joints:    (s.joints   || []).map(j => ({ ...j })),
         cornerEdges: s.cornerEdges || {nw:{type:'none'},ne:{type:'none'},se:{type:'none'},sw:{type:'none'}},
         farmSink:  s.farmSink  || null, // { edge:'top'|'bottom', cx: <px from shape.x> }
+        checks:    (s.checks   || []).filter(c => c.cornerKey || c.vertexIdx != null).map(c => ({ ...c })), // corner notches
     };
     if (base.shapeType === 'l') {
         base.notchW      = s.notchW      || 0;
@@ -745,6 +749,27 @@ const L_CORNER_LABELS = {
     se: ['NW','NE','Step Right','Inner','Step Bot','SW'],
     sw: ['NW','NE','SE','Step Bot','Inner','Step Left'],
 };
+// Physical role of each polygon vertex index, keyed by notchCorner.
+// Used to remap corner-check vertexIdx when the L-shape rotates.
+const L_ROLES = {
+    ne: ['NW','StepTop','Inner','StepRight','SE','SW'],
+    se: ['NW','NE','StepRight','Inner','StepBot','SW'],
+    sw: ['NW','NE','SE','StepBot','Inner','StepLeft'],
+    nw: ['StepTop','NE','SE','SW','StepLeft','Inner'],
+};
+// How each role rotates under a 90° CW shape rotation.
+const L_ROLE_ROT_CW = {
+    NW:'NE', NE:'SE', SE:'SW', SW:'NW',
+    StepTop:'StepRight', StepRight:'StepBot', StepBot:'StepLeft', StepLeft:'StepTop',
+    Inner:'Inner',
+};
+function lVertexIdxAfterRotationCW(oldNotchCorner, oldIdx, newNotchCorner) {
+    const oldRole = L_ROLES[oldNotchCorner]?.[oldIdx];
+    if (!oldRole) return oldIdx;
+    const newRole = L_ROLE_ROT_CW[oldRole] || oldRole;
+    const newIdx = L_ROLES[newNotchCorner]?.indexOf(newRole);
+    return newIdx >= 0 ? newIdx : oldIdx;
+}
 function lShapeSides(s) {
     const pts = lShapePolygon(s);
     const labels = L_SIDE_LABELS[s.notchCorner || 'ne'];
@@ -1167,6 +1192,9 @@ function nearestCornerForEdge(mx, my) {
     return null;
 }
 
+// Returns inside (reflex/concave) corners in canvas coords for a shape.
+// Plus: corners of adjacent rectangles that land on this shape's boundary
+// (common in multi-piece layouts where two rectangles meet to form an L).
 function getInsideCornersForJoint(s) {
     const out = [];
 
@@ -1869,19 +1897,38 @@ function lShapeVerts(s) {
 
 function drawLShape(s, sel) {
     const verts = lShapeVerts(s);
+    const basePoly = lShapePolygon(s);
     const n = verts.length;
     const fill = sel ? 'rgba(201,168,76,0.12)' : 'rgba(218,230,248,0.88)';
 
-    // 1. Fill with corner treatments
+    // Per-vertex check data (A/B/C points). Corner treatment on a vertex is
+    // superseded by a check on the same vertex.
+    const checkAt = new Array(n).fill(null);
+    for (const c of (s.checks || [])) {
+        if (c.vertexIdx != null && c.vertexIdx >= 0 && c.vertexIdx < n) {
+            checkAt[c.vertexIdx] = cornerCheckPoints(basePoly, c.vertexIdx, c);
+        }
+    }
+    const startPt = checkAt[0] ? checkAt[0].B : verts[0].pout;
+
+    // 1. Fill with corner treatments (and carve out corner-check notches)
     ctx.save();
     ctx.beginPath();
-    ctx.moveTo(verts[0].pout[0], verts[0].pout[1]);
+    ctx.moveTo(startPt[0], startPt[1]);
     for (let i = 0; i < n; i++) {
-        const nv = verts[(i+1)%n];
-        ctx.lineTo(nv.pin[0], nv.pin[1]);
-        if (nv.t > 0) {
-            if (nv.r === 0) ctx.lineTo(nv.pout[0], nv.pout[1]);
-            else ctx.arcTo(nv.curr[0], nv.curr[1], nv.pout[0], nv.pout[1], nv.r);
+        const nextI = (i+1)%n;
+        const nv = verts[nextI];
+        const nvCk = checkAt[nextI];
+        if (nvCk) {
+            ctx.lineTo(nvCk.A[0], nvCk.A[1]);
+            ctx.lineTo(nvCk.C[0], nvCk.C[1]);
+            ctx.lineTo(nvCk.B[0], nvCk.B[1]);
+        } else {
+            ctx.lineTo(nv.pin[0], nv.pin[1]);
+            if (nv.t > 0) {
+                if (nv.r === 0) ctx.lineTo(nv.pout[0], nv.pout[1]);
+                else ctx.arcTo(nv.curr[0], nv.curr[1], nv.pout[0], nv.pout[1], nv.r);
+            }
         }
     }
     ctx.closePath();
@@ -1897,14 +1944,20 @@ function drawLShape(s, sel) {
         ctx.restore();
     }
 
-    // 2. Border — 6 sides (endpoints adjusted for corner treatments)
+    // 2. Border — 6 sides (endpoints adjusted for corner treatments + checks)
     for (let i = 0; i < n; i++) {
         const v = verts[i], nv = verts[(i+1)%n];
+        const vCk = checkAt[i], nvCk = checkAt[(i+1)%n];
         const key = `seg${i}`;
-        const sd = { x1: v.pout[0], y1: v.pout[1], x2: nv.pin[0], y2: nv.pin[1] };
+        const sd = {
+            x1: vCk  ? vCk.B[0]  : v.pout[0],
+            y1: vCk  ? vCk.B[1]  : v.pout[1],
+            x2: nvCk ? nvCk.A[0] : nv.pin[0],
+            y2: nvCk ? nvCk.A[1] : nv.pin[1],
+        };
         drawPolyEdgeMaybeFS(s, sd, key, sel);
-        // Draw corner treatment at nv
-        if (nv.t > 0) {
+        // Draw corner treatment at nv — skipped when nv has a check
+        if (nv.t > 0 && !nvCk) {
             if (nv.r === 0) {
                 const diagStoreKey = `lc${(i+1)%n}`;
                 const chData = s.chamferEdges?.[diagStoreKey];
@@ -1971,6 +2024,14 @@ function drawLShape(s, sel) {
         }
     }
 
+    // 2b. Check notch inner walls (two perpendicular 'none' segments per notch)
+    for (let i = 0; i < n; i++) {
+        const c = checkAt[i];
+        if (!c) continue;
+        drawEdgeDatum({ type:'none' }, `lck${i}_ac`, c.A[0], c.A[1], c.C[0], c.C[1], sel);
+        drawEdgeDatum({ type:'none' }, `lck${i}_cb`, c.C[0], c.C[1], c.B[0], c.B[1], sel);
+    }
+
     // 3. Dimension lines (vertex to vertex — shows full physical dimension)
     const pts = lShapePolygon(s);
     for (let i=0; i<6; i++) {
@@ -1981,13 +2042,21 @@ function drawLShape(s, sel) {
     // 4. Selection outline
     if (sel) {
         ctx.save(); ctx.strokeStyle='#5fb8c2'; ctx.lineWidth=2; ctx.setLineDash([3,3]);
-        ctx.beginPath(); ctx.moveTo(verts[0].pout[0], verts[0].pout[1]);
+        ctx.beginPath(); ctx.moveTo(startPt[0], startPt[1]);
         for (let i=0; i<n; i++) {
-            const nv=verts[(i+1)%n];
-            ctx.lineTo(nv.pin[0],nv.pin[1]);
-            if (nv.t>0) {
-                if (nv.r===0) ctx.lineTo(nv.pout[0],nv.pout[1]);
-                else ctx.arcTo(nv.curr[0],nv.curr[1],nv.pout[0],nv.pout[1],nv.r);
+            const nextI = (i+1)%n;
+            const nv = verts[nextI];
+            const nvCk = checkAt[nextI];
+            if (nvCk) {
+                ctx.lineTo(nvCk.A[0], nvCk.A[1]);
+                ctx.lineTo(nvCk.C[0], nvCk.C[1]);
+                ctx.lineTo(nvCk.B[0], nvCk.B[1]);
+            } else {
+                ctx.lineTo(nv.pin[0], nv.pin[1]);
+                if (nv.t > 0) {
+                    if (nv.r === 0) ctx.lineTo(nv.pout[0], nv.pout[1]);
+                    else ctx.arcTo(nv.curr[0], nv.curr[1], nv.pout[0], nv.pout[1], nv.r);
+                }
             }
         }
         ctx.closePath(); ctx.stroke(); ctx.setLineDash([]); ctx.restore();
@@ -2026,19 +2095,38 @@ function uShapeVerts(s) {
 
 function drawUShape(s, sel) {
     const verts = uShapeVerts(s);
+    const basePoly = uShapePolygon(s);
     const n = verts.length;
     const fill = sel ? 'rgba(201,168,76,0.12)' : 'rgba(218,230,248,0.88)';
 
-    // 1. Fill with corner treatments
+    // Per-vertex check data (A/B/C points). Check overrides corner treatment
+    // on the same vertex.
+    const checkAt = new Array(n).fill(null);
+    for (const c of (s.checks || [])) {
+        if (c.vertexIdx != null && c.vertexIdx >= 0 && c.vertexIdx < n) {
+            checkAt[c.vertexIdx] = cornerCheckPoints(basePoly, c.vertexIdx, c);
+        }
+    }
+    const startPt = checkAt[0] ? checkAt[0].B : verts[0].pout;
+
+    // 1. Fill with corner treatments (and carve out corner-check notches)
     ctx.save();
     ctx.beginPath();
-    ctx.moveTo(verts[0].pout[0], verts[0].pout[1]);
+    ctx.moveTo(startPt[0], startPt[1]);
     for (let i = 0; i < n; i++) {
-        const nv = verts[(i+1)%n];
-        ctx.lineTo(nv.pin[0], nv.pin[1]);
-        if (nv.t > 0) {
-            if (nv.r === 0) ctx.lineTo(nv.pout[0], nv.pout[1]);
-            else ctx.arcTo(nv.curr[0], nv.curr[1], nv.pout[0], nv.pout[1], nv.r);
+        const nextI = (i+1)%n;
+        const nv = verts[nextI];
+        const nvCk = checkAt[nextI];
+        if (nvCk) {
+            ctx.lineTo(nvCk.A[0], nvCk.A[1]);
+            ctx.lineTo(nvCk.C[0], nvCk.C[1]);
+            ctx.lineTo(nvCk.B[0], nvCk.B[1]);
+        } else {
+            ctx.lineTo(nv.pin[0], nv.pin[1]);
+            if (nv.t > 0) {
+                if (nv.r === 0) ctx.lineTo(nv.pout[0], nv.pout[1]);
+                else ctx.arcTo(nv.curr[0], nv.curr[1], nv.pout[0], nv.pout[1], nv.r);
+            }
         }
     }
     ctx.closePath();
@@ -2054,15 +2142,22 @@ function drawUShape(s, sel) {
         ctx.restore();
     }
 
-    // 2. Border — 8 sides with endpoints adjusted for corner treatments
+    // 2. Border — 8 sides with endpoints adjusted for corner treatments + checks
     const labels = U_SIDE_LABELS[s.uOpening || 'top'];
     for (let i = 0; i < n; i++) {
         const v = verts[i], nv = verts[(i+1)%n];
+        const vCk = checkAt[i], nvCk = checkAt[(i+1)%n];
         const key = `seg${i}`;
-        const sd = { x1: v.pout[0], y1: v.pout[1], x2: nv.pin[0], y2: nv.pin[1], label: labels[i], key };
+        const sd = {
+            x1: vCk  ? vCk.B[0]  : v.pout[0],
+            y1: vCk  ? vCk.B[1]  : v.pout[1],
+            x2: nvCk ? nvCk.A[0] : nv.pin[0],
+            y2: nvCk ? nvCk.A[1] : nv.pin[1],
+            label: labels[i], key
+        };
         drawPolyEdgeMaybeFS(s, sd, key, sel);
-        // Corner treatment rendering at nv
-        if (nv.t > 0) {
+        // Corner treatment rendering at nv — skipped when nv has a check
+        if (nv.t > 0 && !nvCk) {
             if (nv.r === 0) {
                 // Chamfer diagonal — selectable as diag_uc{index}
                 const diagStoreKey = `uc${(i+1)%n}`;
@@ -2128,6 +2223,14 @@ function drawUShape(s, sel) {
         }
     }
 
+    // 2b. Check notch inner walls (two perpendicular 'none' segments per notch)
+    for (let i = 0; i < n; i++) {
+        const c = checkAt[i];
+        if (!c) continue;
+        drawEdgeDatum({ type:'none' }, `uck${i}_ac`, c.A[0], c.A[1], c.C[0], c.C[1], sel);
+        drawEdgeDatum({ type:'none' }, `uck${i}_cb`, c.C[0], c.C[1], c.B[0], c.B[1], sel);
+    }
+
     // 3. Dimension lines — vertex to vertex
     const pts = uShapePolygon(s);
     for (let i=0;i<8;i++) {
@@ -2135,11 +2238,12 @@ function drawUShape(s, sel) {
         drawDimLine(pts[i][0],pts[i][1],pts[j][0],pts[j][1], Math.hypot(pts[j][0]-pts[i][0],pts[j][1]-pts[i][1]), s.id, `dim_u${i}`);
     }
 
-    // 4. Selection outline
+    // 4. Selection outline (follows the notched polygon)
     if (sel) {
         ctx.save(); ctx.strokeStyle='#5fb8c2'; ctx.lineWidth=2; ctx.setLineDash([3,3]);
-        ctx.beginPath(); ctx.moveTo(pts[0][0],pts[0][1]);
-        for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0],pts[i][1]);
+        const polyOut = injectCornerChecks(basePoly, s.checks);
+        ctx.beginPath(); ctx.moveTo(polyOut[0][0], polyOut[0][1]);
+        for (let i=1;i<polyOut.length;i++) ctx.lineTo(polyOut[i][0], polyOut[i][1]);
         ctx.closePath(); ctx.stroke(); ctx.setLineDash([]); ctx.restore();
     }
     drawFsOutlineLabel(s);
@@ -2299,9 +2403,27 @@ function drawShape(s, sel) {
         return;
     }
 
-    roundedRectPath(ctx, s.x, s.y, s.w, s.h, r, ch, chB);
-    ctx.fillStyle = fill;
-    ctx.fill();
+    // For plain rects with checks (no corner treatments / farm sink), fill
+    // the notched polygon directly so the fill never bleeds into the notch —
+    // the piece genuinely reads as "material removed".
+    const hasAnyChamfer = ch.nw || ch.ne || ch.se || ch.sw;
+    const hasAnyRadius  = r.nw  || r.ne  || r.se  || r.sw;
+    const hasChecks     = (s.checks || []).length > 0;
+    if (hasChecks && !hasAnyChamfer && !hasAnyRadius && !s.farmSink && (s.shapeType || 'rect') === 'rect') {
+        const localPoly = buildRectPolyWithChecks(s);
+        ctx.beginPath();
+        ctx.moveTo(s.x + localPoly[0][0] * INCH, s.y + localPoly[0][1] * INCH);
+        for (let i = 1; i < localPoly.length; i++) {
+            ctx.lineTo(s.x + localPoly[i][0] * INCH, s.y + localPoly[i][1] * INCH);
+        }
+        ctx.closePath();
+        ctx.fillStyle = fill;
+        ctx.fill();
+    } else {
+        roundedRectPath(ctx, s.x, s.y, s.w, s.h, r, ch, chB);
+        ctx.fillStyle = fill;
+        ctx.fill();
+    }
 
     // Carve out farmhouse sink notch (paint over with canvas background)
     if (s.farmSink) {
@@ -2315,17 +2437,39 @@ function drawShape(s, sel) {
         ctx.restore();
     }
 
+    // (Corner-check notches: fill uses the notched polygon above; adjacent
+    // border edges are naturally shortened and the two inner walls of each
+    // notch are drawn separately below.)
+
     // 2. Border — each side drawn with its profile
     // A = along first incoming side, B = along outgoing side (0 = goes all the way to corner)
     const nwA = ch.nw > 0 ? ch.nw : r.nw,  nwB = ch.nw > 0 ? chB.nw : r.nw;
     const neA = ch.ne > 0 ? ch.ne : r.ne,  neB = ch.ne > 0 ? chB.ne : r.ne;
     const seA = ch.se > 0 ? ch.se : r.se,  seB = ch.se > 0 ? chB.se : r.se;
     const swA = ch.sw > 0 ? ch.sw : r.sw,  swB = ch.sw > 0 ? chB.sw : r.sw;
+    // Corner check notches shorten the two edges meeting at that corner by
+    // the check's width (along horizontal edge) and depth (along vertical
+    // edge). The two perpendicular inner walls of the notch are drawn
+    // separately below with plain ('none') profile.
+    const ckByCorner = { nw:null, ne:null, se:null, sw:null };
+    if (hasChecks && (s.shapeType || 'rect') === 'rect') {
+        for (const c of s.checks) {
+            if (ckByCorner.hasOwnProperty(c.cornerKey)) ckByCorner[c.cornerKey] = c;
+        }
+    }
+    const nwCkW = ckByCorner.nw ? ckByCorner.nw.w : 0;
+    const nwCkD = ckByCorner.nw ? ckByCorner.nw.d : 0;
+    const neCkW = ckByCorner.ne ? ckByCorner.ne.w : 0;
+    const neCkD = ckByCorner.ne ? ckByCorner.ne.d : 0;
+    const seCkW = ckByCorner.se ? ckByCorner.se.w : 0;
+    const seCkD = ckByCorner.se ? ckByCorner.se.d : 0;
+    const swCkW = ckByCorner.sw ? ckByCorner.sw.w : 0;
+    const swCkD = ckByCorner.sw ? ckByCorner.sw.d : 0;
     const sides = [
-        { key:'top',    x1:s.x+nwA,    y1:s.y,          x2:s.x+s.w-neA, y2:s.y         },
-        { key:'right',  x1:s.x+s.w,    y1:s.y+neB,      x2:s.x+s.w,      y2:s.y+s.h-seA},
-        { key:'bottom', x1:s.x+s.w-seB,y1:s.y+s.h,      x2:s.x+swA,      y2:s.y+s.h    },
-        { key:'left',   x1:s.x,         y1:s.y+s.h-swB,  x2:s.x,          y2:s.y+nwB    },
+        { key:'top',    x1:s.x+nwA+nwCkW,   y1:s.y,              x2:s.x+s.w-neA-neCkW, y2:s.y               },
+        { key:'right',  x1:s.x+s.w,          y1:s.y+neB+neCkD,   x2:s.x+s.w,           y2:s.y+s.h-seA-seCkD },
+        { key:'bottom', x1:s.x+s.w-seB-seCkW,y1:s.y+s.h,         x2:s.x+swA+swCkW,     y2:s.y+s.h           },
+        { key:'left',   x1:s.x,              y1:s.y+s.h-swB-swCkD,x2:s.x,              y2:s.y+nwB+nwCkD     },
     ];
     for (const sd of sides) {
         const edgeData = s.edges?.[sd.key];
@@ -2353,6 +2497,30 @@ function drawShape(s, sel) {
         if (sd.key === 'left')   labelOffset = { dx:-14, dy:0 };
         if (sd.key === 'right')  labelOffset = { dx: 14, dy:0 };
         drawEdgeDatum(edgeData || { type: 'none' }, sd.key, sd.x1, sd.y1, sd.x2, sd.y2, sel, labelOffset);
+    }
+    // Draw the two perpendicular inner walls for each corner notch, with
+    // plain 'none' profile. These form the L-shape that reads as carved-out.
+    if (hasChecks && (s.shapeType || 'rect') === 'rect') {
+        if (ckByCorner.nw) {
+            const { w, d } = ckByCorner.nw;
+            drawEdgeDatum({ type:'none' }, 'ck_nw_h', s.x,     s.y + d, s.x + w, s.y + d, sel);
+            drawEdgeDatum({ type:'none' }, 'ck_nw_v', s.x + w, s.y + d, s.x + w, s.y,     sel);
+        }
+        if (ckByCorner.ne) {
+            const { w, d } = ckByCorner.ne;
+            drawEdgeDatum({ type:'none' }, 'ck_ne_v', s.x + s.w - w, s.y,     s.x + s.w - w, s.y + d, sel);
+            drawEdgeDatum({ type:'none' }, 'ck_ne_h', s.x + s.w - w, s.y + d, s.x + s.w,     s.y + d, sel);
+        }
+        if (ckByCorner.se) {
+            const { w, d } = ckByCorner.se;
+            drawEdgeDatum({ type:'none' }, 'ck_se_h', s.x + s.w,     s.y + s.h - d, s.x + s.w - w, s.y + s.h - d, sel);
+            drawEdgeDatum({ type:'none' }, 'ck_se_v', s.x + s.w - w, s.y + s.h - d, s.x + s.w - w, s.y + s.h,     sel);
+        }
+        if (ckByCorner.sw) {
+            const { w, d } = ckByCorner.sw;
+            drawEdgeDatum({ type:'none' }, 'ck_sw_v', s.x + w, s.y + s.h,     s.x + w, s.y + s.h - d, sel);
+            drawEdgeDatum({ type:'none' }, 'ck_sw_h', s.x + w, s.y + s.h - d, s.x,     s.y + s.h - d, sel);
+        }
     }
 
     // 2b. Corner arcs — styled per cornerEdges assignment
@@ -2720,7 +2888,7 @@ function render() {
     drawMeasurements();
     drawProfileDiags();
     drawChamferPickUI();
-    // When the joint tool is active, pulse accent dots on every inside corner
+    // When the joint tool is active, pulse gold dots on every inside corner
     // of every shape so the user knows exactly where joints can be placed.
     if (tool === 'joint') {
         ctx.save();
@@ -2731,7 +2899,7 @@ function render() {
                 // Halo
                 ctx.beginPath();
                 ctx.arc(c.x, c.y, 12, 0, Math.PI * 2);
-                ctx.strokeStyle = 'rgba(95,184,194,0.35)';
+                ctx.strokeStyle = 'rgba(176,144,48,0.35)';
                 ctx.lineWidth = 2.5;
                 ctx.stroke();
                 // Solid dot
@@ -2746,13 +2914,49 @@ function render() {
         }
         ctx.restore();
     }
-    // Joint-snap indicator: accent dot + halo when a joint drag is locked to an inside corner
+    // When the Check tool is active, highlight each convex corner on every
+    // shape so the user can pick which corner gets the notch.
+    if (tool === 'check') {
+        ctx.save();
+        const drawDot = (x, y) => {
+            ctx.beginPath();
+            ctx.arc(x, y, 12, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(176,144,48,0.35)';
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(x, y, 5, 0, Math.PI * 2);
+            ctx.fillStyle = '#5fb8c2';
+            ctx.fill();
+            ctx.lineWidth = 1.5;
+            ctx.strokeStyle = '#ffffff';
+            ctx.stroke();
+        };
+        for (const s of shapes) {
+            if (s.subtype) continue;
+            const st = s.shapeType || 'rect';
+            if (st === 'rect') {
+                drawDot(s.x,       s.y      );
+                drawDot(s.x + s.w, s.y      );
+                drawDot(s.x + s.w, s.y + s.h);
+                drawDot(s.x,       s.y + s.h);
+            } else if (st === 'l' || st === 'u') {
+                const poly = st === 'l' ? lShapePolygon(s) : uShapePolygon(s);
+                for (const i of convexVertexIndices(poly)) {
+                    drawDot(poly[i][0], poly[i][1]);
+                }
+            }
+        }
+        ctx.restore();
+    }
+
+    // Joint-snap indicator: gold dot + halo when a joint drag is locked to an inside corner
     if (jointSnapCorner) {
         ctx.save();
         // Halo
         ctx.beginPath();
         ctx.arc(jointSnapCorner.x, jointSnapCorner.y, 10, 0, Math.PI * 2);
-        ctx.strokeStyle = 'rgba(95,184,194,0.35)';
+        ctx.strokeStyle = 'rgba(176,144,48,0.35)';
         ctx.lineWidth = 3;
         ctx.stroke();
         // Solid dot
@@ -2831,10 +3035,11 @@ function drawLegendSwatches() {
 //  Popup helpers
 // ─────────────────────────────────────────────────────────────
 function hideAllPopups() {
-    ['size-popup','lshape-popup','ushape-popup','bsp-popup','circle-popup','sink-popup','radius-popup','edge-popup','joint-popup','text-popup'].forEach(id =>
+    ['size-popup','lshape-popup','ushape-popup','bsp-popup','circle-popup','sink-popup','radius-popup','edge-popup','joint-popup','check-popup','text-popup'].forEach(id =>
         document.getElementById(id).style.display = 'none');
     currentPopup = null; pendingPlace = null; pendingCorner = null;
     pendingEdge = null; pendingJointShape = null; pendingJointPos = null;
+    pendingCheckShape = null; pendingCheckCorner = null; pendingCheckVertex = null;
 }
 
 function screenPos(cvX, cvY) {
@@ -3336,6 +3541,93 @@ function confirmJointPopup() {
 }
 document.getElementById('joint-ok').addEventListener('click', confirmJointPopup);
 document.getElementById('joint-cancel').addEventListener('click', () => hideAllPopups());
+
+// ── Check (notch) popup ──────────────────────────────────────
+// A "check" is a rectangular notch cut out of a CORNER of a rect piece, used
+// to accommodate wall obstructions, columns, posts, etc. Stored on the shape
+// as s.checks = [{ id, cornerKey, w, d }] where w/d are in pixels and
+// cornerKey is 'nw'/'ne'/'se'/'sw'. w runs along the corner's horizontal
+// edge (top/bottom), d runs along the corner's vertical edge (left/right).
+let pendingCheckShape  = null;
+let pendingCheckCorner = null;
+let pendingCheckVertex = null;
+function showCheckPopup(cvX, cvY) {
+    hideAllPopups();
+    currentPopup = 'check';
+    const sp = screenPos(cvX, cvY);
+    showPopupAt(document.getElementById('check-popup'), sp.x + 20, sp.y - 20);
+    const widthInp = document.getElementById('check-width');
+    setTimeout(() => { widthInp.focus(); widthInp.select(); }, 50);
+}
+function confirmCheckPopup() {
+    if (!pendingCheckShape || (!pendingCheckCorner && pendingCheckVertex == null)) { hideAllPopups(); return; }
+    const widthIn = Math.max(0.25, parseFloat(document.getElementById('check-width').value) || 4);
+    const depthIn = Math.max(0.25, parseFloat(document.getElementById('check-depth').value) || 4);
+    const s = pendingCheckShape;
+    const wPx = widthIn * INCH, dPx = depthIn * INCH;
+
+    // For rect, W is along horizontal edge (compared to s.w) and D is vertical (s.h).
+    // For L/U, W/D are along the two adjacent polygon edges at the chosen vertex.
+    const st = s.shapeType || 'rect';
+    if (st === 'rect') {
+        if (wPx >= s.w - 0.5) { alert(`Width ${widthIn}" is as wide as the piece (${(s.w/INCH).toFixed(2)}"). Reduce width.`); return; }
+        if (dPx >= s.h - 0.5) { alert(`Depth ${depthIn}" is as tall as the piece (${(s.h/INCH).toFixed(2)}"). Reduce depth.`); return; }
+    } else if (st === 'l' || st === 'u') {
+        const poly = st === 'l' ? lShapePolygon(s) : uShapePolygon(s);
+        const n = poly.length;
+        const i = pendingCheckVertex;
+        const P = poly[(i - 1 + n) % n];
+        const V = poly[i];
+        const N = poly[(i + 1) % n];
+        const inLen = Math.hypot(V[0]-P[0], V[1]-P[1]);
+        const outLen = Math.hypot(N[0]-V[0], N[1]-V[1]);
+        if (wPx >= inLen - 0.5)  { alert(`Width ${widthIn}" is too large for this edge (${(inLen/INCH).toFixed(2)}"). Reduce width.`); return; }
+        if (dPx >= outLen - 0.5) { alert(`Depth ${depthIn}" is too large for the adjacent edge (${(outLen/INCH).toFixed(2)}"). Reduce depth.`); return; }
+    }
+
+    if (!s.checks) s.checks = [];
+    pushUndo();
+    if (st === 'rect') {
+        s.checks = s.checks.filter(c => c.cornerKey !== pendingCheckCorner);
+        s.checks.push({ id: Date.now(), cornerKey: pendingCheckCorner, w: wPx, d: dPx });
+    } else {
+        s.checks = s.checks.filter(c => c.vertexIdx !== pendingCheckVertex);
+        s.checks.push({ id: Date.now(), vertexIdx: pendingCheckVertex, w: wPx, d: dPx });
+    }
+    pendingCheckShape = null; pendingCheckCorner = null; pendingCheckVertex = null; pendingCheckVertex = null;
+    persist(); hideAllPopups(); setTool('select'); render();
+}
+document.getElementById('check-ok').addEventListener('click', confirmCheckPopup);
+document.getElementById('check-cancel').addEventListener('click', () => {
+    pendingCheckShape = null; pendingCheckCorner = null; pendingCheckVertex = null;
+    hideAllPopups();
+});
+document.getElementById('check-width').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); confirmCheckPopup(); }
+    if (e.key === 'Escape') { e.preventDefault(); hideAllPopups(); }
+    e.stopPropagation();
+});
+document.getElementById('check-depth').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); confirmCheckPopup(); }
+    if (e.key === 'Escape') { e.preventDefault(); hideAllPopups(); }
+    e.stopPropagation();
+});
+
+// Sum of all check (notch) areas on a shape, in pixels². Subtracted from the
+// shape's gross area for sqft calculations and cutting cost.
+function totalCheckAreaPx(s) {
+    if (!s.checks || !s.checks.length) return 0;
+    return s.checks.reduce((a, c) => a + c.w * c.d, 0);
+}
+
+// Returns absolute canvas rect {x, y, w, h} for a check on a rect shape.
+function checkRectAbs(s, c) {
+    if (c.cornerKey === 'nw') return { x: s.x,              y: s.y,              w: c.w, h: c.d };
+    if (c.cornerKey === 'ne') return { x: s.x + s.w - c.w,  y: s.y,              w: c.w, h: c.d };
+    if (c.cornerKey === 'se') return { x: s.x + s.w - c.w,  y: s.y + s.h - c.d,  w: c.w, h: c.d };
+    if (c.cornerKey === 'sw') return { x: s.x,              y: s.y + s.h - c.d,  w: c.w, h: c.d };
+    return null;
+}
 
 // ── L-Shape popup ────────────────────────────────────────────
 let lshapeCorner    = 'ne';
@@ -3874,6 +4166,7 @@ cv.addEventListener('mousedown', e => {
                 let segX1 = eh.x1, segY1 = eh.y1, segX2 = eh.x2, segY2 = eh.y2;
                 const edgeData = eh.s.edges[eh.key];
                 if (edgeData?.type === 'segmented' && edgeData.segments?.length) {
+                    // Find which segment was clicked and apply mitered to just that one
                     const fullLen = Math.hypot(eh.x2 - eh.x1, eh.y2 - eh.y1);
                     const dx = (eh.x2 - eh.x1) / fullLen, dy = (eh.y2 - eh.y1) / fullLen;
                     const t = Math.max(0, Math.min(1, ((p.x - eh.x1)*(eh.x2-eh.x1) + (p.y - eh.y1)*(eh.y2-eh.y1)) / (fullLen*fullLen)));
@@ -3894,6 +4187,7 @@ cv.addEventListener('mousedown', e => {
                 } else {
                     eh.s.edges[eh.key] = { type: 'mitered' };
                 }
+                // Create the strip using segment coordinates (not full edge)
                 const segLenPx = Math.hypot(segX2 - segX1, segY2 - segY1);
                 const miterPx = miterW * INCH;
                 const gapPx = 2 * INCH;
@@ -4122,6 +4416,45 @@ cv.addEventListener('mousedown', e => {
         setTool('select');
         selectedText = newId;
         render(); return;
+    }
+
+    // ── Check (rectangular notch at a corner) ──
+    if (tool === 'check') {
+        const SNAP = 40;
+        let best = { dist: SNAP, s: null, cornerKey: null, vertexIdx: null, cx: 0, cy: 0 };
+        for (const s of shapes) {
+            if (s.subtype) continue;
+            const st = s.shapeType || 'rect';
+            if (st === 'rect') {
+                const corners = [
+                    { key:'nw', x: s.x,       y: s.y       },
+                    { key:'ne', x: s.x + s.w, y: s.y       },
+                    { key:'se', x: s.x + s.w, y: s.y + s.h },
+                    { key:'sw', x: s.x,       y: s.y + s.h },
+                ];
+                for (const cn of corners) {
+                    const d = Math.hypot(p.x - cn.x, p.y - cn.y);
+                    if (d < best.dist) best = { dist: d, s, cornerKey: cn.key, vertexIdx: null, cx: cn.x, cy: cn.y };
+                }
+            } else if (st === 'l' || st === 'u') {
+                const poly = st === 'l' ? lShapePolygon(s) : uShapePolygon(s);
+                for (const i of convexVertexIndices(poly)) {
+                    const d = Math.hypot(p.x - poly[i][0], p.y - poly[i][1]);
+                    if (d < best.dist) best = { dist: d, s, cornerKey: null, vertexIdx: i, cx: poly[i][0], cy: poly[i][1] };
+                }
+            }
+        }
+        if (!best.s) {
+            alert('Click near a convex corner of a piece to place a check.');
+            return;
+        }
+        // showCheckPopup calls hideAllPopups() which wipes pendingCheck*,
+        // so set them AFTER opening the popup.
+        showCheckPopup(best.cx, best.cy);
+        pendingCheckShape   = best.s;
+        pendingCheckCorner  = best.cornerKey;
+        pendingCheckVertex  = best.vertexIdx;
+        return;
     }
 
     // ── Joint ──
@@ -4384,7 +4717,10 @@ cv.addEventListener('mousemove', e => {
     }
     if (tool === 'joint') {
         const jh = hitJoint(p.x, p.y);
-        cv.style.cursor = jh ? 'ew-resize' : (hitShape(p.x,p.y) ? 'crosshair' : 'default'); return;
+        if (jh) { cv.style.cursor = 'ew-resize'; return; }
+        // Crosshair inside any shape (corner-snap preferred, free placement fallback)
+        cv.style.cursor = hitShape(p.x, p.y) ? 'crosshair' : 'default';
+        return;
     }
     if (tool === 'select') {
         if (hitJoint(p.x, p.y)) { cv.style.cursor = 'ew-resize'; return; }
@@ -4508,11 +4844,23 @@ document.addEventListener('keydown', e => {
         if (s) {
             e.preventDefault(); pushUndo();
             if (s.shapeType === 'l') {
+                const oldNotch = s.notchCorner || 'ne';
                 const cycle = { ne:'se', se:'sw', sw:'nw', nw:'ne' };
-                s.notchCorner = cycle[s.notchCorner || 'ne'] || 'se';
+                const newNotch = cycle[oldNotch] || 'se';
+                // Remap check vertex indices for the new polygon layout
+                if (s.checks && s.checks.length) {
+                    for (const c of s.checks) {
+                        if (c.vertexIdx != null) {
+                            c.vertexIdx = lVertexIdxAfterRotationCW(oldNotch, c.vertexIdx, newNotch);
+                        }
+                    }
+                }
+                s.notchCorner = newNotch;
                 const oldW = s.w, oldH = s.h, oldNW = s.notchW, oldNH = s.notchH;
                 s.w = oldH; s.h = oldW; s.notchW = oldNH; s.notchH = oldNW;
             } else if (s.shapeType === 'u') {
+                // U polygon vertex indices are stable across uOpening rotations,
+                // so s.checks[].vertexIdx stays unchanged.
                 const cycle = { top:'right', right:'bottom', bottom:'left', left:'top' };
                 s.uOpening = cycle[s.uOpening || 'top'] || 'right';
                 const oldW = s.w, oldH = s.h, oldLW = s.leftW, oldRW = s.rightW, oldCH = s.channelH;
@@ -4520,7 +4868,18 @@ document.addEventListener('keydown', e => {
             } else if (s.shapeType === 'circle') {
                 // No change — circles are symmetric
             } else {
-                // Rectangles, BSP, sinks, cooktops — swap w and h
+                // Rect / BSP / sinks / cooktops — swap w and h.
+                // Rect corner checks: cycle cornerKey CW and swap w↔d so the
+                // physical notch rotates with the piece.
+                if (s.checks && s.checks.length && (s.shapeType || 'rect') === 'rect') {
+                    const cyc = { nw:'ne', ne:'se', se:'sw', sw:'nw' };
+                    for (const c of s.checks) {
+                        if (c.cornerKey) {
+                            c.cornerKey = cyc[c.cornerKey] || c.cornerKey;
+                            const ow = c.w; c.w = c.d; c.d = ow;
+                        }
+                    }
+                }
                 const oldW = s.w; s.w = s.h; s.h = oldW;
             }
             // Keep shape within canvas
@@ -4596,7 +4955,7 @@ document.getElementById('text-content').addEventListener('keydown', e => {
 });
 
 // ─────────────────────────────────────────────────────────────
-const TOOL_BTNS = { draw:'btn-draw', ldraw:'btn-ldraw', udraw:'btn-udraw', bsp:'btn-bsp', circle:'btn-circle', select:'btn-select', radius:'btn-radius', edge:'btn-edge', splitedge:'btn-splitedge', joint:'btn-joint', sink:'btn-sink', farmsink:'btn-farmsink', cooktop:'btn-cooktop', outlet:'btn-outlet', bocci:'btn-bocci', text:'btn-text', measure:'btn-measure' };
+const TOOL_BTNS = { draw:'btn-draw', ldraw:'btn-ldraw', udraw:'btn-udraw', bsp:'btn-bsp', circle:'btn-circle', select:'btn-select', radius:'btn-radius', edge:'btn-edge', splitedge:'btn-splitedge', joint:'btn-joint', check:'btn-check', sink:'btn-sink', farmsink:'btn-farmsink', cooktop:'btn-cooktop', outlet:'btn-outlet', bocci:'btn-bocci', text:'btn-text', measure:'btn-measure' };
 function setTool(t) {
     ghostText = null; // cancel any floating text
     measurePt1 = null; measureHover = null;
@@ -4604,10 +4963,10 @@ function setTool(t) {
     drawing = false; moving = false; resizing = false; edgeResizing = null; draggingJoint = false; jointSnapCorner = null;
     hovCorner = null; hovEdge = null; hovCornerEdge = null;
     selectedText = null;
-    cv.style.cursor = ['draw','ldraw','udraw','bsp','circle','sink','farmsink','cooktop','outlet','bocci','radius','edge','splitedge','joint','measure'].includes(t) ? 'crosshair' : 'default';
+    cv.style.cursor = ['draw','ldraw','udraw','bsp','circle','sink','farmsink','cooktop','outlet','bocci','radius','edge','splitedge','joint','check','measure'].includes(t) ? 'crosshair' : 'default';
     document.getElementById('edge-palette').style.display = t === 'edge' ? 'flex' : 'none';
     Object.entries(TOOL_BTNS).forEach(([k,id]) => document.getElementById(id).classList.toggle('active', k === t));
-    const labels = { draw:'Draw Rectangle', ldraw:'Draw L-Shape', udraw:'Draw U-Shape', bsp:'Draw Backsplash', circle:'Draw Circle', select:'Select / Move', radius:'Add Radius', edge:'Edge Profile', splitedge:'Split Edge', joint:'Joint Line', sink:'Sink', farmsink:'Farmhouse Sink (30×16)', cooktop:'Cooktop', outlet:'Outlet (2×4")', bocci:'Bocci Outlet (2" circle)', text:'Add Text', measure:'Outil de Mesure' };
+    const labels = { draw:'Draw Rectangle', ldraw:'Draw L-Shape', udraw:'Draw U-Shape', bsp:'Draw Backsplash', circle:'Draw Circle', select:'Select / Move', radius:'Add Radius', edge:'Edge Profile', splitedge:'Split Edge', joint:'Joint Line', check:'Check (notch)', sink:'Sink', farmsink:'Farmhouse Sink (30×16)', cooktop:'Cooktop', outlet:'Outlet (2×4")', bocci:'Bocci Outlet (2" circle)', text:'Add Text', measure:'Outil de Mesure' };
     document.getElementById('st-tool').innerHTML = `Tool: <b>${labels[t]||t}</b>`;
     render();
 }
@@ -5110,6 +5469,7 @@ const STONE_TYPES = ['Quartz','Granite','Marble','Quartzite','Sintered Stone'];
 const STANDARD_FINISHES     = ['Polished','Matte','Honed','Leathered','Velvet','Grip+','Satin','Brushed'];
 const STANDARD_THICKNESSES  = ['0.8cm','1.2cm','2cm','3cm'];
 
+// Union of all finishes / thicknesses known across matDb + the standard starters
 function allKnownFinishes() {
     const s = new Set(STANDARD_FINISHES);
     for (const m of matDb) (m.finishes || []).forEach(f => s.add(f));
@@ -5118,6 +5478,7 @@ function allKnownFinishes() {
 function allKnownThicknesses() {
     const s = new Set(STANDARD_THICKNESSES);
     for (const m of matDb) (m.thicknesses || []).forEach(t => s.add(t));
+    // Sort numerically by the "cm" prefix number
     return [...s].sort((a, b) => parseFloat(a) - parseFloat(b));
 }
 
@@ -5183,6 +5544,7 @@ function renderMatDb() {
         matDb = matDb.filter(m => m.id !== +e.target.dataset.dbid);
         saveMatDb(); renderMatDb();
     }));
+    // Thickness checkbox toggles
     container.querySelectorAll('.matdb-thk').forEach(cb => cb.addEventListener('change', e => {
         const db = matDb.find(m => m.id === +e.target.dataset.dbid);
         if (!db) return;
@@ -5192,6 +5554,7 @@ function renderMatDb() {
         else db.thicknesses = db.thicknesses.filter(x => x !== v);
         saveMatDb(); renderMatDb();
     }));
+    // Finish checkbox toggles
     container.querySelectorAll('.matdb-fin').forEach(cb => cb.addEventListener('change', e => {
         const db = matDb.find(m => m.id === +e.target.dataset.dbid);
         if (!db) return;
@@ -5201,6 +5564,7 @@ function renderMatDb() {
         else db.finishes = db.finishes.filter(x => x !== v);
         saveMatDb(); renderMatDb();
     }));
+    // Add custom thickness / finish
     container.querySelectorAll('.matdb-add-thk').forEach(btn => btn.addEventListener('click', e => {
         const db = matDb.find(m => m.id === +e.target.dataset.dbid);
         if (!db) return;
@@ -5333,6 +5697,7 @@ function calcTotalSqft() {
                 if (s.shapeType === 'u') area = uShapeAreaPx(s);
                 if (s.shapeType === 'circle') area = Math.PI * (s.w / 2) * (s.h / 2);
                 if (s.farmSink) area -= (FS_WIDTH_IN * INCH) * (FS_DEPTH_IN * INCH);
+                area -= totalCheckAreaPx(s);
                 total += area;
             }
         }
@@ -5537,6 +5902,7 @@ function calcServiceQtys() {
             if (s.shapeType === 'u') area = uShapeAreaPx(s);
             if (s.shapeType === 'circle') area = Math.PI * (s.w/2) * (s.h/2);
             if (s.farmSink) area -= (FS_WIDTH_IN * INCH) * (FS_DEPTH_IN * INCH);
+            area -= totalCheckAreaPx(s);
             const sqft = area / SQFT_PX2;
             totalSqft += sqft;
             // Check if material is Dekton
@@ -5585,17 +5951,10 @@ function getServiceLineItems() {
         }
         const rate = R[d.key] || 0;
         let cost = qty * rate;
-        // Installation: custom override (Pricing tab) wins; else apply min fee floor.
+        // Installation minimum fee: floor the installation cost if min > 0
         if (d.key === 'installation') {
-            const instCustomRaw = pricingData.installationCustom;
-            const instCustom = (instCustomRaw != null && instCustomRaw !== '')
-                ? (parseFloat(instCustomRaw) || 0) : 0;
-            if (instCustom > 0) {
-                cost = instCustom;
-            } else {
-                const minFee = pricingData.installationMin || 0;
-                if (minFee > 0 && cost < minFee) cost = minFee;
-            }
+            const minFee = pricingData.installationMin || 0;
+            if (minFee > 0 && cost < minFee) cost = minFee;
         }
         return { ...d, qty, rate, cost, unitLabel };
     }).filter(item => item.qty > 0 || item.rate > 0);
@@ -5635,7 +5994,7 @@ function renderCostsPanel() {
                     </div>
                     <div style="display:flex;align-items:center;gap:4px;flex-shrink:0">
                         <span style="color:#888;font-size:10px">$/slab</span>
-                        <input class="mat-input cost-slab-inp" data-dbid="${m.id}" type="number" min="0" step="1" style="width:75px;text-align:right" value="${m.costPerSlab||''}" placeholder="0">
+                        <input class="mat-input cost-slab-inp" data-dbid="${m.id}" type="text" inputmode="decimal" style="width:75px;text-align:right" value="${m.costPerSlab||''}" placeholder="0">
                     </div>
                     <div class="cost-sqft-lbl" data-dbid="${m.id}" style="color:#999;font-size:9px;width:55px;text-align:right;flex-shrink:0">${perSqft}/sqft</div>
                 </div>`;
@@ -5663,12 +6022,12 @@ function renderCostsPanel() {
         const unitLabels = { lf:'$/lin ft', sqft:'$/sqft', each:'$ / each' };
         let html = SERVICE_RATE_DEFS.map(f => `<div style="display:flex;align-items:center;gap:6px;padding:4px 4px;border-bottom:1px solid #333">
             <span style="flex:1;color:#e0ddd5;font-size:11px">${f.label} <span style="color:#555;font-size:9px">${unitLabels[f.unit]||''}</span></span>
-            <input class="mat-input cost-rate-inp" data-rkey="${f.key}" type="number" min="0" step="0.01" style="width:75px;text-align:right" value="${R[f.key]||0}">
+            <input class="mat-input cost-rate-inp" data-rkey="${f.key}" type="text" inputmode="decimal" style="width:75px;text-align:right" value="${R[f.key]||0}">
         </div>`).join('');
         // Installation minimum fee row
         html += `<div style="display:flex;align-items:center;gap:6px;padding:4px 4px;border-bottom:1px solid #333;background:#181818">
             <span style="flex:1;color:#e0ddd5;font-size:11px">Installation min. fee <span style="color:#555;font-size:9px">$ flat floor</span></span>
-            <input class="mat-input cost-inst-min-inp" type="number" min="0" step="1" style="width:75px;text-align:right" value="${pricingData.installationMin||0}">
+            <input class="mat-input cost-inst-min-inp" type="text" inputmode="decimal" style="width:75px;text-align:right" value="${pricingData.installationMin||0}">
         </div>`;
         rateContainer.innerHTML = html;
         rateContainer.querySelectorAll('.cost-rate-inp').forEach(inp => inp.addEventListener('input', e => {
@@ -5712,6 +6071,7 @@ function renderPricingPanel() {
             if (s.shapeType === 'u') area = uShapeAreaPx(s);
             if (s.shapeType === 'circle') area = Math.PI * (s.w/2) * (s.h/2);
             if (s.farmSink) area -= (FS_WIDTH_IN * INCH) * (FS_DEPTH_IN * INCH);
+            area -= totalCheckAreaPx(s);
             pageSqft += area / SQFT_PX2;
         }
         pageSqftById[page.id] = pageSqft;
@@ -5756,11 +6116,11 @@ function renderPricingPanel() {
             <div style="font-size:9px;color:#888;margin-bottom:4px">${msqft.toFixed(2)} sqft total · suggested ${suggestedQty} slab${suggestedQty!==1?'s':''}</div>
             <div style="display:flex;gap:6px;align-items:center;margin-bottom:3px">
                 <span style="font-size:10px;color:#999;min-width:50px">Qty slabs</span>
-                <input class="mat-input pricing-slab-qty" data-mid="${mid}" type="number" min="0" step="1" value="${slabQty}" style="width:60px;text-align:right">
+                <input class="mat-input pricing-slab-qty" data-mid="${mid}" type="text" inputmode="numeric" value="${slabQty}" style="width:60px;text-align:right">
             </div>
             <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px">
                 <span style="font-size:10px;color:#999;min-width:50px">$/slab</span>
-                <input class="mat-input pricing-slab-price" data-mid="${mid}" type="number" min="0" step="0.01" value="${pricePerSlab}" style="width:80px;text-align:right" ${hasDbPrice && !useCustom ? 'placeholder="DB: '+dbCostPerSlab.toFixed(2)+'"' : ''}>
+                <input class="mat-input pricing-slab-price" data-mid="${mid}" type="text" inputmode="decimal" value="${pricePerSlab}" style="width:80px;text-align:right" ${hasDbPrice && !useCustom ? 'placeholder="DB: '+dbCostPerSlab.toFixed(2)+'"' : ''}>
                 ${!hasDbPrice ? '<span style="font-size:8px;color:#e05c5c">no DB price</span>' : ''}
             </div>
             <div style="display:flex;justify-content:space-between;font-size:10px;color:#aaa;padding:2px 0;border-top:1px dashed #333">
@@ -5789,19 +6149,21 @@ function renderPricingPanel() {
         pageBlocksByPageId.get(pid).push({ mid, ...b });
     }
 
-    // Warn about canvas pages that have shapes but no linked Page-type material
+    // Warn about canvas pages that have shapes but no linked material
     const orphanPages = pages.filter(p => (pageSqftById[p.id] || 0) > 0 && !pageBlocksByPageId.has(p.id));
     if (orphanPages.length > 0) {
         sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px;border:1px dashed #e0a050;border-radius:6px;padding:8px;background:#1f1b10">
             <div style="color:#e0a050;font-size:11px;font-weight:700;margin-bottom:3px">⚠ Page(s) without a linked material</div>
-            <div style="color:#aaa;font-size:10px">These canvas pages have shapes but no Page-type material assigned: ${orphanPages.map(p=>p.name).join(', ')}. Add a material of type "Page" and link it to each page to include them in pricing.</div>
+            <div style="color:#aaa;font-size:10px">These canvas pages have shapes but no linked material: ${orphanPages.map(p=>p.name).join(', ')}. Add a material of type "Page" and link it to each page to include them in pricing.</div>
         </div>`;
     }
 
     // ── Pages: one section per canvas page, with 1 or more linked materials ──
-    // The committed grand-total assumes the FIRST option of each multi-option page;
-    // full combinations are rendered in their own section below.
+    // Track per-page selected option subtotals for the "committed" total.
+    // (The committed grand-total assumes the FIRST option of each multi-option page;
+    //  full combinations are rendered in their own section below.)
     let anyMultiOptionPage = false;
+    // Iterate in page order for a stable layout
     for (const page of pages) {
         const blocks = pageBlocksByPageId.get(page.id);
         if (!blocks || blocks.length === 0) continue;
@@ -5853,7 +6215,7 @@ function renderPricingPanel() {
     //  so each Option's displayed total can include the shared baseline.)
 
     // ── Service line items (only show if qty > 0) ────────────
-    // Exclude polissageSous from auto list — it has its own toggle below
+    // Exclude polissageSous, measurements, installation, coupe, dektonCoupe — each has its own block/attribution
     const allServiceItems = getServiceLineItems();
     const items = allServiceItems.filter(i => i.key !== 'polissageSous' && i.key !== 'measurements' && i.key !== 'installation' && i.key !== 'coupe' && i.key !== 'dektonCoupe' && i.qty > 0);
     let serviceCostTotal = items.reduce((s, i) => s + i.cost, 0);
@@ -5884,38 +6246,30 @@ function renderPricingPanel() {
         </div>
         <div id="pricing-ps-fields" style="display:${psEnabled ? 'flex' : 'none'};gap:6px;align-items:center;padding:4px 0">
             <span style="font-size:10px;color:#999">Qty:</span>
-            <input class="mat-input" id="pricing-ps-qty" type="number" min="1" step="1" value="${psQty || 1}" style="width:50px;text-align:right">
+            <input class="mat-input" id="pricing-ps-qty" type="text" inputmode="numeric" value="${psQty || 1}" style="width:50px;text-align:right">
             <span style="font-size:10px;color:#999">× ${fmt$(psRate)}</span>
             <span style="font-size:11px;font-weight:700;color:#5fb8c2;margin-left:auto">${psEnabled ? fmt$(psCost) : ''}</span>
         </div>
     </div>`;
 
-    // ── Installation (with minimum fee + optional custom override) ───
-    // Costs tab "Installation min. fee" (pricingData.installationMin) is applied silently
-    // as a floor. The Pricing tab also exposes a "Custom install price"
+    // ── Installation ─────────────────────────────────────────
+    // Costs tab's "Installation min. fee" (pricingData.installationMin) is applied silently
+    // as a floor. The Pricing tab exposes a "Custom install price" field
     // (pricingData.installationCustom) that, when set, OVERRIDES the computed value.
     const instRate = pricingData.rates.installation || 0;
-    const instItem = allServiceItems.find(i => i.key === 'installation');
-    const instSqft = instItem ? instItem.qty : 0;
+    const instSqft = (allServiceItems.find(i => i.key === 'installation')?.qty) || 0;
     const instRawCost = instSqft * instRate;
     const instMin = pricingData.installationMin || 0;
     const instCustom = (pricingData.installationCustom != null && pricingData.installationCustom !== '')
         ? (parseFloat(pricingData.installationCustom) || 0) : null;
-    const instCustomActive = instCustom != null && instCustom > 0;
-    const instCost = instCustomActive ? instCustom : Math.max(instRawCost, instMin);
-    const instMinApplied = !instCustomActive && instMin > 0 && instRawCost < instMin;
-    if (instRate > 0 || instMin > 0 || instCustomActive) serviceCostTotal += instCost;
+    const instCost = instCustom != null && instCustom > 0 ? instCustom : Math.max(instRawCost, instMin);
+    if (instRate > 0 || instMin > 0 || (instCustom||0) > 0) serviceCostTotal += instCost;
 
     sumHtml += `<div class="room-pricing-section" style="margin-bottom:10px">
         <div class="price-check-label">Installation</div>
         <div style="display:flex;align-items:center;gap:6px;padding:3px 0">
             <span style="font-size:10px;color:#999;flex:1">${instSqft.toFixed(2)} sqft × ${fmt$(instRate)}</span>
-            <span style="font-size:10px;color:${instCustomActive ? '#777' : (instMinApplied?'#777':'#5fb8c2')};${(instCustomActive || instMinApplied) ? 'text-decoration:line-through' : ''}">${fmt$(Math.max(instRawCost, instMin))}</span>
-        </div>
-        <div style="display:flex;align-items:center;gap:6px;padding:3px 0">
-            <span style="font-size:10px;color:#999">Min. fee</span>
-            <input class="mat-input" id="pricing-inst-min" type="number" min="0" step="1" value="${instMin}" style="width:70px;text-align:right">
-            <span style="font-size:9px;color:${instMinApplied?'#e0a050':'#555'};margin-left:6px">${instMinApplied ? 'min applied' : ''}</span>
+            <span style="font-size:11px;font-weight:700;color:${instCustom != null && instCustom > 0 ? '#777' : '#5fb8c2'};${instCustom != null && instCustom > 0 ? 'text-decoration:line-through' : ''}">${fmt$(Math.max(instRawCost, instMin))}</span>
         </div>
         <div style="display:flex;align-items:center;gap:6px;padding:3px 0">
             <span style="font-size:10px;color:#999;flex:1">Custom install price <span style="font-size:8.5px;color:#666">(leave blank to use calculated)</span></span>
@@ -5946,9 +6300,9 @@ function renderPricingPanel() {
     const TAX = 1.14975;
     const committedWithTax = committedTotal * TAX;
     let committedLabel;
-    if (optionsGrp.length > 0)        committedLabel = 'Committed subtotal (shared)';
-    else if (anyMultiOptionPage)      committedLabel = 'Reference total — using Option 1 of each multi-option page';
-    else                              committedLabel = 'Grand Total';
+    if (optionsGrp.length > 0) committedLabel = 'Committed subtotal (shared)';
+    else if (anyMultiOptionPage)  committedLabel = 'Reference total — using Option 1 of each multi-option page';
+    else                           committedLabel = 'Grand Total';
     sumHtml += `<div class="room-pricing-section" style="margin-top:8px;padding:8px;background:#3d5a68;border:1px solid #5fb8c2;border-radius:6px">
         <div class="price-check-row" style="font-weight:bold;font-size:13px">
             <span class="price-check-name">${committedLabel} (pre-tax)</span>
@@ -5992,6 +6346,7 @@ function renderPricingPanel() {
                 return { name: `${c.page.name}${optLabel} (${matName})`, cost: c.block.matSubtotal };
             });
             const preT = matSum + serviceCostTotal;
+            const TAX = 1.14975; // GST 5% + QST 9.975% (same as PDF)
             const withTax = preT * TAX;
             combosHtml += `<div style="margin-bottom:8px;padding:8px;background:#141414;border:1px solid #333;border-radius:4px">
                 <div style="font-size:11px;font-weight:700;color:#5fb8c2;margin-bottom:4px">Combination ${ci+1}</div>
@@ -6046,6 +6401,7 @@ function renderPricingPanel() {
     summaryContainer.innerHTML = sumHtml;
 
     // ── Wire up interactive inputs ───────────────────────────
+    // Slab qty
     // Slab qty — `change` fires on blur/Enter so typing stays focused
     summaryContainer.querySelectorAll('.pricing-slab-qty').forEach(inp => {
         inp.addEventListener('change', e => {
@@ -6078,20 +6434,17 @@ function renderPricingPanel() {
     });
     // Polissage sous qty
     const psQtyInp = document.getElementById('pricing-ps-qty');
-    if (psQtyInp) psQtyInp.addEventListener('input', e => {
-        pricingData.polissageSousQty = parseInt(e.target.value) || 0;
-        savePricing(); renderPricingPanel();
-    });
+    if (psQtyInp) {
+        psQtyInp.addEventListener('change', e => {
+            pricingData.polissageSousQty = parseInt(e.target.value) || 0;
+            savePricing(); renderPricingPanel();
+        });
+        psQtyInp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); psQtyInp.blur(); } });
+    }
     // Measurements toggle
     const measToggle = document.getElementById('pricing-meas-toggle');
     if (measToggle) measToggle.addEventListener('change', e => {
         pricingData.measurementsEnabled = e.target.checked;
-        savePricing(); renderPricingPanel();
-    });
-    // Installation minimum fee
-    const instMinInp = document.getElementById('pricing-inst-min');
-    if (instMinInp) instMinInp.addEventListener('input', e => {
-        pricingData.installationMin = parseFloat(e.target.value) || 0;
         savePricing(); renderPricingPanel();
     });
     // Custom install price — fires on blur/Enter (NOT input) so typing stays focused
@@ -6161,8 +6514,10 @@ let regQuotes = [];         // cached list of quotes from Supabase
 let regFilterStatus = 'all';
 let regSearchTerm = '';
 
-// Client-side UUID generator — every quote gets a STABLE id, making saves
-// idempotent: if the row doesn't exist we can recreate it under the same id.
+// Client-side UUID generator — used so every quote has a STABLE id that
+// belongs to the client, not the server. This makes saves idempotent: whether
+// the row exists or not, we always target the same id, and if the row is
+// missing we can recreate it (see saveQuoteToDb below).
 function _uuidv4() {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
@@ -6173,6 +6528,8 @@ function _uuidv4() {
 }
 
 // ── Save-status indicator (top-right toast) ────────────────────────
+// Shows "Saving…", "Saved 3:42 PM", or "⚠ Save failed — retry" so the user
+// always knows whether their work actually reached the database.
 let _saveStatusEl = null;
 function _ensureSaveStatusEl() {
     if (_saveStatusEl) return _saveStatusEl;
@@ -6192,12 +6549,25 @@ function setSaveStatus(state, extra) {
         el.style.border = '1px solid #5fb8c2';
         el.innerHTML = '⟳ Saving…';
     } else if (state === 'saved') {
-        el.style.background = '#1f2a0f';
-        el.style.color = '#b5d070';
-        el.style.border = '1px solid #3a5020';
         const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        el.innerHTML = `✓ Saved · ${ts}`;
-        setTimeout(() => { if (_saveStatusEl && el.innerHTML.startsWith('✓')) el.style.display = 'none'; }, 4000);
+        // Warn loudly when we saved an empty row — that's almost always a bug
+        // (user expected to save a quote they filled in but formData was empty).
+        const isEmpty = !formData.client && !formData.order && !formData.job;
+        const hasShapes = pages.some(p => (p.shapes||[]).length > 0);
+        if (isEmpty && !hasShapes) {
+            el.style.background = '#3a2a10';
+            el.style.color = '#ffcc55';
+            el.style.border = '1px solid #cc9930';
+            el.innerHTML = `⚠ Saved EMPTY quote · ${ts}<div style="font-weight:400;font-size:9px;margin-top:3px;color:#ffd">No client/order/job/shapes — click Save only AFTER filling in the form</div>`;
+            setTimeout(() => { if (_saveStatusEl && el.innerHTML.startsWith('⚠ Saved EMPTY')) el.style.display = 'none'; }, 8000);
+        } else {
+            el.style.background = '#1f2a0f';
+            el.style.color = '#b5d070';
+            el.style.border = '1px solid #3a5020';
+            const label = formData.client || formData.job || formData.order || `${pages.reduce((n,p)=>n+(p.shapes||[]).length,0)} shapes`;
+            el.innerHTML = `✓ Saved · ${ts}<div style="font-weight:400;font-size:9px;margin-top:3px;color:#cfd">${label}</div>`;
+            setTimeout(() => { if (_saveStatusEl && el.innerHTML.startsWith('✓')) el.style.display = 'none'; }, 4000);
+        }
     } else if (state === 'failed') {
         el.style.background = '#3a1a1a';
         el.style.color = '#ff8888';
@@ -6211,8 +6581,13 @@ function setSaveStatus(state, extra) {
 
 // Save current state as a quote to Supabase.
 // Returns { ok: true, id } on success, { ok: false, error } on failure.
-// Self-healing: if the target row is missing (deleted or never inserted),
-// the save is converted from UPDATE to INSERT so the quote always lands.
+// Strategy:
+//   1. Assign a stable client-generated UUID if none exists.
+//   2. If row with that id is missing from the DB (deleted or never inserted),
+//      insert it. Otherwise update. Every save path is now idempotent and
+//      self-healing — a stale localStorage id won't cause silent data loss.
+//   3. On ANY failure, auto-download a JSON backup so the user never loses
+//      their work even if Supabase is unreachable.
 async function saveQuoteToDb() {
     if (!currentShopId || !currentUserId) return { ok: false, error: 'Not signed in' };
     setSaveStatus('saving');
@@ -6228,7 +6603,7 @@ async function saveQuoteToDb() {
 
     // Diagnostic — surface what's actually being saved + a stack trace so we
     // can identify which code path triggered this save.
-    console.log('[saveQuoteToDb]', {
+    const _diag = {
         formData_client: formData.client,
         formData_order:  formData.order,
         formData_job:    formData.job,
@@ -6236,21 +6611,28 @@ async function saveQuoteToDb() {
         dom_order:  (document.getElementById('f-order')  || {}).value,
         dom_job:    (document.getElementById('f-job')    || {}).value,
         shapeCount: pages.reduce((n, p) => n + (p.shapes||[]).length, 0),
+        pageCount:  pages.length,
         currentQuoteId,
-    });
+    };
+    console.log('[saveQuoteToDb]', _diag);
+    console.trace('[saveQuoteToDb] stack');
 
     // GUARDRAIL — refuse to UPDATE an existing row with completely empty data.
+    // If formData has no client/order/job AND there are no shapes, the user
+    // is almost certainly NOT trying to save anything; this guards against
+    // the New-Quote-reset → auto-sync race that was clobbering rows.
     const _isEmpty = !formData.client && !formData.order && !formData.job;
     const _hasShapes = pages.some(p => (p.shapes||[]).length > 0);
     if (currentQuoteId && _isEmpty && !_hasShapes) {
         console.warn('[saveQuoteToDb] REFUSED — would clobber existing row', currentQuoteId, 'with empty data');
-        setSaveStatus('saved');
+        setSaveStatus('saved');  // toast still shows; we're "successful" (a no-op)
         return { ok: true, id: currentQuoteId, skipped: true };
     }
 
-    // Track whether the id was pre-existing so we can distinguish first-save
-    // of a brand-new quote (no UPDATE attempt needed) from a self-heal INSERT
-    // after the row went missing.
+    // Ensure we have a stable id. If this is a brand-new quote, mint one
+    // locally and persist it so every subsequent save targets the same row.
+    // Track whether the id was fresh so we can distinguish normal first-saves
+    // from the "row was missing and we had to recreate it" self-heal path.
     const hadExistingId = !!currentQuoteId;
     if (!currentQuoteId) {
         currentQuoteId = _uuidv4();
@@ -6273,6 +6655,10 @@ async function saveQuoteToDb() {
     };
 
     try {
+        // Fresh id → skip the UPDATE attempt (row can't exist) and go straight
+        // to INSERT. For existing ids, try UPDATE first; if it affects 0 rows
+        // the row is missing (deleted or never persisted) — fall back to INSERT
+        // to self-heal under the same id.
         if (hadExistingId) {
             const upd = await _sb.from('quotes').update(row).eq('id', currentQuoteId).select('id');
             if (upd.error) throw upd.error;
@@ -6282,6 +6668,7 @@ async function saveQuoteToDb() {
                 return { ok: true, id: currentQuoteId };
             }
         }
+        // Either a brand-new quote, or the row was missing. INSERT it.
         row.status = 'draft';
         const ins = await _sb.from('quotes').insert(row).select('id').single();
         if (ins.error) throw ins.error;
@@ -6291,6 +6678,8 @@ async function saveQuoteToDb() {
     } catch (err) {
         console.error('saveQuoteToDb failed:', err);
         setSaveStatus('failed', err.message || err.code || String(err));
+        // Emergency local backup so the user's work isn't lost even if every
+        // save to the cloud fails.
         try { _downloadQuoteJson(); } catch (_) {}
         return { ok: false, error: err.message || String(err) };
     }
@@ -6341,8 +6730,9 @@ async function loadQuoteFromDb(quoteId) {
 }
 
 // Refresh the registry list from Supabase.
-// Fetches both active and soft-deleted rows; the Trash tab shows deleted ones.
-// Requires the deleted_at column from supabase_migration_soft_delete.sql.
+// Fetches BOTH active and soft-deleted rows; client-side filter tab chooses
+// which bucket to display. Requires the deleted_at column from the
+// supabase_migration_soft_delete.sql migration.
 async function regRefresh() {
     if (!currentShopId) return;
     const { data, error } = await _sb.from('quotes')
@@ -6358,6 +6748,7 @@ function regRenderList() {
     const list = document.getElementById('reg-list');
     if (!list) return;
     const viewingTrash = regFilterStatus === 'trash';
+    // Active view hides deleted rows; Trash view shows ONLY deleted rows.
     let filtered = viewingTrash
         ? regQuotes.filter(q => q.deleted_at)
         : regQuotes.filter(q => !q.deleted_at);
@@ -6414,9 +6805,9 @@ async function regSetStatus(quoteId, status) {
     regRenderList();
 }
 
-// Soft delete — flags the row with deleted_at. Row stays in the DB and
-// can be restored from the Trash tab. Hard delete is blocked by RLS (see
-// supabase_migration_soft_delete.sql).
+// Soft delete — flags the row with deleted_at. Row stays in the database
+// and can be restored from the Trash tab. Hard delete is blocked by RLS
+// (see supabase_migration_soft_delete.sql).
 async function regDeleteQuote(quoteId) {
     const q = regQuotes.find(x => x.id === quoteId);
     const label = q ? `"${q.client_name || q.job_name || q.order_number || '(no name)'}"` : 'this quote';
@@ -6432,6 +6823,7 @@ async function regDeleteQuote(quoteId) {
     regUpdateCurrentBanner();
 }
 
+// Restore a soft-deleted quote back into the active list.
 async function regRestoreQuote(quoteId) {
     const { error } = await _sb.from('quotes')
         .update({ deleted_at: null, updated_at: new Date().toISOString() })
@@ -6472,14 +6864,23 @@ document.querySelectorAll('.reg-filter-btn').forEach(btn => {
 });
 document.getElementById('reg-refresh-btn').addEventListener('click', regRefresh);
 document.getElementById('reg-new-btn').addEventListener('click', async () => {
-    if (currentQuoteId && !confirm('Start a new quote? Current work will be saved first.')) return;
+    console.log('[NEW QUOTE] click — currentQuoteId at start:', currentQuoteId);
+    if (currentQuoteId && !confirm('Start a new quote? Current work will be saved first.')) {
+        console.log('[NEW QUOTE] aborted at first confirm');
+        return;
+    }
     if (currentQuoteId) {
+        console.log('[NEW QUOTE] saving current quote before reset...');
         const r = await saveQuoteToDb();
+        console.log('[NEW QUOTE] save returned:', r);
         if (!r || !r.ok) {
-            if (!confirm('Save failed (a JSON backup was downloaded). Continue starting a new quote anyway? Your current work may be lost.')) return;
+            if (!confirm('Save failed (a JSON backup was downloaded). Continue starting a new quote anyway? Your current work may be lost.')) {
+                console.log('[NEW QUOTE] aborted at second confirm');
+                return;
+            }
         }
     }
-    // Reset to blank
+    console.log('[NEW QUOTE] running reset…');
     currentQuoteId = null;
     localStorage.removeItem('mondial_currentQuoteId');
     pages = [{ id:1, name:'Page 1', shapes:[], textItems:[], measurements:[], nextId:1, _undo:[] }];
@@ -6496,6 +6897,7 @@ document.getElementById('reg-new-btn').addEventListener('click', async () => {
     syncPageIn(); renderPageTabs(); render(); updateStatus();
     regUpdateCurrentBanner();
     switchPanelTab('layout');
+    console.log('[NEW QUOTE] reset complete — currentQuoteId:', currentQuoteId, 'localStorage:', localStorage.getItem('mondial_currentQuoteId'));
 });
 
 // ══════════════════════════════════════════════════════════════════════
@@ -6598,11 +7000,113 @@ function injectFsNotchInchesLocal(poly, s) {
     return out;
 }
 
+// Build a shape-local inches polygon for a plain rect with checks.
+// Walks the 4 edges CW and injects a U-shaped notch for each check on that edge.
+function buildRectPolyWithChecks(s) {
+    const wi = s.w / INCH, hi = s.h / INCH;
+    const byCorner = { nw: null, ne: null, se: null, sw: null };
+    for (const c of (s.checks || [])) {
+        if (byCorner.hasOwnProperty(c.cornerKey)) {
+            byCorner[c.cornerKey] = { wIn: c.w / INCH, dIn: c.d / INCH };
+        }
+    }
+    const out = [];
+    // Walk CW starting at (or near) the top-left corner.
+    // NW corner: if notched, enter the top edge at (nw.w, 0) instead of (0,0).
+    if (byCorner.nw) out.push([byCorner.nw.wIn, 0]);
+    else             out.push([0, 0]);
+    // Top edge → NE corner
+    if (byCorner.ne) {
+        out.push([wi - byCorner.ne.wIn, 0]);
+        out.push([wi - byCorner.ne.wIn, byCorner.ne.dIn]);
+        out.push([wi,                    byCorner.ne.dIn]);
+    } else {
+        out.push([wi, 0]);
+    }
+    // Right edge → SE corner
+    if (byCorner.se) {
+        out.push([wi,                    hi - byCorner.se.dIn]);
+        out.push([wi - byCorner.se.wIn,  hi - byCorner.se.dIn]);
+        out.push([wi - byCorner.se.wIn,  hi]);
+    } else {
+        out.push([wi, hi]);
+    }
+    // Bottom edge → SW corner
+    if (byCorner.sw) {
+        out.push([byCorner.sw.wIn, hi]);
+        out.push([byCorner.sw.wIn, hi - byCorner.sw.dIn]);
+        out.push([0,               hi - byCorner.sw.dIn]);
+    } else {
+        out.push([0, hi]);
+    }
+    // Left edge → back to NW corner (close the loop)
+    if (byCorner.nw) {
+        out.push([0,                    byCorner.nw.dIn]);
+        out.push([byCorner.nw.wIn,      byCorner.nw.dIn]);
+    }
+    return out;
+}
+
+// Indices of convex vertices on a CW polygon (in screen coords, y-down).
+// These are the corners that can take a rectangular check notch.
+function convexVertexIndices(poly) {
+    const out = [];
+    const n = poly.length;
+    for (let i = 0; i < n; i++) {
+        const P = poly[(i - 1 + n) % n];
+        const V = poly[i];
+        const N = poly[(i + 1) % n];
+        const inx = V[0] - P[0], iny = V[1] - P[1];
+        const outx = N[0] - V[0], outy = N[1] - V[1];
+        if (inx * outy - iny * outx > 0) out.push(i);
+    }
+    return out;
+}
+
+// Compute A (entry on incoming edge), B (exit on outgoing edge), and C
+// (interior corner) for a rectangular notch cut at polygon vertex i.
+function cornerCheckPoints(basePoly, i, check) {
+    const n = basePoly.length;
+    const P = basePoly[(i - 1 + n) % n];
+    const V = basePoly[i];
+    const N = basePoly[(i + 1) % n];
+    const inLen = Math.hypot(V[0] - P[0], V[1] - P[1]);
+    const outLen = Math.hypot(N[0] - V[0], N[1] - V[1]);
+    if (inLen < 1 || outLen < 1) return null;
+    const W = Math.min(check.w, inLen - 0.5);
+    const D = Math.min(check.d, outLen - 0.5);
+    const inDx = (V[0] - P[0]) / inLen, inDy = (V[1] - P[1]) / inLen;
+    const outDx = (N[0] - V[0]) / outLen, outDy = (N[1] - V[1]) / outLen;
+    const A = [V[0] - W * inDx,              V[1] - W * inDy];
+    const B = [V[0] + D * outDx,             V[1] + D * outDy];
+    const C = [V[0] - W * inDx + D * outDx,  V[1] - W * inDy + D * outDy];
+    return { A, B, C };
+}
+
+// Inject corner-check notches into a general polygon (for L/U shapes).
+// Each check has { vertexIdx, w, d } keyed by its polygon index.
+function injectCornerChecks(poly, checks) {
+    const byIdx = new Map();
+    for (const c of (checks || [])) {
+        if (c.vertexIdx != null) byIdx.set(c.vertexIdx, c);
+    }
+    if (byIdx.size === 0) return poly.slice();
+    const out = [];
+    for (let i = 0; i < poly.length; i++) {
+        const c = byIdx.get(i);
+        if (!c) { out.push(poly[i]); continue; }
+        const pts = cornerCheckPoints(poly, i, c);
+        if (!pts) { out.push(poly[i]); continue; }
+        out.push(pts.A, pts.C, pts.B);
+    }
+    return out;
+}
+
 function shapeLocalPolyInches(s) {
     const st = s.shapeType || 'rect';
     const toLocal = pts => pts.map(([x,y]) => [(x - s.x)/INCH, (y - s.y)/INCH]);
-    if (st === 'l')   return injectFsNotchInchesLocal(toLocal(lShapePolygon(s)), s);
-    if (st === 'u')   return injectFsNotchInchesLocal(toLocal(uShapePolygon(s)), s);
+    if (st === 'l')   return injectFsNotchInchesLocal(toLocal(injectCornerChecks(lShapePolygon(s), s.checks)), s);
+    if (st === 'u')   return injectFsNotchInchesLocal(toLocal(injectCornerChecks(uShapePolygon(s), s.checks)), s);
     if (st === 'bsp') return toLocal(bspPolygon(s));
     if (st === 'circle') {
         // 32-point polygon approximation of the circle for kerf/collision
@@ -6622,7 +7126,13 @@ function shapeLocalPolyInches(s) {
     const hasChamfer = ch.nw||ch.ne||ch.se||ch.sw;
     const hasRadius  = r.nw||r.ne||r.se||r.sw;
     const hasFS      = !!s.farmSink;
-    if (!hasChamfer && !hasRadius && !hasFS) return [[0,0],[wi,0],[wi,hi],[0,hi]];
+    const hasChecks  = (s.checks || []).length > 0;
+    if (!hasChamfer && !hasRadius && !hasFS && !hasChecks) return [[0,0],[wi,0],[wi,hi],[0,hi]];
+    // Plain rect with ONLY checks (no corner treatments / farm sink) → build
+    // polygon by walking each edge and injecting check notches along the way.
+    if (!hasChamfer && !hasRadius && !hasFS && hasChecks) {
+        return buildRectPolyWithChecks(s);
+    }
 
     const pts = [];
     const toIn = v => v / INCH; // canvas px → inches
@@ -6779,13 +7289,16 @@ function slabPieceOverlaps(slabIdx, x, y, w, h, excludeId, inRef, inRot) {
     return false;
 }
 
+// Returns true if any part of the piece extends into the dead zone of its slab.
 function slabPieceInDeadZone(slabIdx, x, y, w, h, ref, rotation) {
     const sd = slabDefs[slabIdx];
     if (!sd) return false;
     const dz = sd.deadZone || 0;
     if (dz <= 0) return false;
+    // Usable area in slab-local inches (piece coords are relative to the inside of the dead zone)
     const usableW = sd.w - 2 * dz;
     const usableH = sd.h - 2 * dz;
+    // Check polygon vertices if available
     if (ref) {
         const poly = piecePolyInches(x, y, ref, rotation || 0);
         for (const [px, py] of poly) {
@@ -6793,6 +7306,7 @@ function slabPieceInDeadZone(slabIdx, x, y, w, h, ref, rotation) {
         }
         return false;
     }
+    // Fallback: bounding box check
     return x < 0 || y < 0 || x + w > usableW || y + h > usableH;
 }
 
@@ -6810,6 +7324,10 @@ function shapeLocalRects(s) {
     if (hasChamfer || hasRadius) return null;
     if (s.farmSink) return null;
     if (st === 'circle') return null;
+    // Shapes with checks can't use rect decomposition — the notches make the
+    // outline non-rectangular. Fall back to SH polygon clipping which uses
+    // shapeLocalPolyInches (which already injects check notches).
+    if ((s.checks || []).length > 0) return null;
 
     if (st === 'rect' || !st) return [{ x: 0, y: 0, w: wi, h: hi }];
 
@@ -7221,12 +7739,15 @@ function rectUnionPolygon(rects) {
 
 // Removes degenerate vertices from a clipped polygon:
 //   - consecutive duplicates (zero-length edges)
-//   - collinear middle vertices (SH leaves these when a clip line coincides
-//     with a polygon edge, creating a zero-area "slit" that distorts the
-//     vertex bounding box)
+//   - collinear middle vertices (Sutherland-Hodgman leaves these when a clip
+//     line coincides with a polygon edge, which creates a "slit" along the
+//     clip line that distorts the vertex bounding box but has zero area)
+// After cleanup, a polygon that encloses a pure rectangle has exactly 4
+// vertices at the corners.
 function cleanClippedPolygon(pts) {
     if (!pts || pts.length === 0) return pts;
     const EPS = 1e-5;
+    // 1. Remove consecutive duplicates
     let out = [];
     for (let i = 0; i < pts.length; i++) {
         const [x, y] = pts[i];
@@ -7237,6 +7758,7 @@ function cleanClippedPolygon(pts) {
     while (out.length > 1 && Math.abs(out[0][0] - out[out.length-1][0]) < EPS && Math.abs(out[0][1] - out[out.length-1][1]) < EPS) {
         out.pop();
     }
+    // 2. Iteratively remove collinear middle vertices
     let changed = true;
     while (changed && out.length > 3) {
         changed = false;
@@ -7581,46 +8103,78 @@ function slabDrawSlab(ctx, sd, idx, ox, oy, sc, mockupMode) {
                 for (let i = 1; i < pts.length; i++) ctx.lineTo(px + pts[i][0]*sc, py + pts[i][1]*sc);
                 ctx.closePath();
             } else if (shapeType === 'l' && shape && p.ref.segIdx == null) {
-                // Full L-shape — lShapeVerts for exact corner/chamfer treatment
+                // Full L-shape — lShapeVerts for exact corner/chamfer treatment,
+                // with corner checks (A→C→B) replacing treatment at notched verts.
                 const verts = lShapeVerts(shape);
+                const basePoly = lShapePolygon(shape);
                 const n = verts.length;
-                const v0 = convAbs(verts[0].pout);
+                const checkAt = new Array(n).fill(null);
+                for (const c of (shape.checks || [])) {
+                    if (c.vertexIdx != null && c.vertexIdx >= 0 && c.vertexIdx < n) {
+                        checkAt[c.vertexIdx] = cornerCheckPoints(basePoly, c.vertexIdx, c);
+                    }
+                }
+                const v0 = convAbs(checkAt[0] ? checkAt[0].B : verts[0].pout);
                 ctx.moveTo(v0[0], v0[1]);
                 for (let i = 0; i < n; i++) {
-                    const nv = verts[(i+1)%n];
-                    const pin = convAbs(nv.pin);
-                    ctx.lineTo(pin[0], pin[1]);
-                    if (nv.t > 0) {
-                        if (nv.r === 0) {
-                            const pout = convAbs(nv.pout);
-                            ctx.lineTo(pout[0], pout[1]);
-                        } else {
-                            const curr = convAbs(nv.curr);
-                            const pout = convAbs(nv.pout);
-                            ctx.arcTo(curr[0], curr[1], pout[0], pout[1], nv.r / INCH * sc);
+                    const nextI = (i+1)%n;
+                    const nv = verts[nextI];
+                    const nvCk = checkAt[nextI];
+                    if (nvCk) {
+                        const A = convAbs(nvCk.A), C = convAbs(nvCk.C), B = convAbs(nvCk.B);
+                        ctx.lineTo(A[0], A[1]);
+                        ctx.lineTo(C[0], C[1]);
+                        ctx.lineTo(B[0], B[1]);
+                    } else {
+                        const pin = convAbs(nv.pin);
+                        ctx.lineTo(pin[0], pin[1]);
+                        if (nv.t > 0) {
+                            if (nv.r === 0) {
+                                const pout = convAbs(nv.pout);
+                                ctx.lineTo(pout[0], pout[1]);
+                            } else {
+                                const curr = convAbs(nv.curr);
+                                const pout = convAbs(nv.pout);
+                                ctx.arcTo(curr[0], curr[1], pout[0], pout[1], nv.r / INCH * sc);
+                            }
                         }
                     }
                 }
                 ctx.closePath();
             } else if (shapeType === 'u' && shape && p.ref.segIdx == null) {
-                // Mirror L-shape: use vertex data with corner treatments so
-                // radius arcs and chamfers render on the slab layout.
+                // Mirror L-shape: verts with corner treatments + check notches
                 const verts = uShapeVerts(shape);
+                const basePoly = uShapePolygon(shape);
                 const n = verts.length;
-                const v0p = convAbs(verts[0].pout);
+                const checkAt = new Array(n).fill(null);
+                for (const c of (shape.checks || [])) {
+                    if (c.vertexIdx != null && c.vertexIdx >= 0 && c.vertexIdx < n) {
+                        checkAt[c.vertexIdx] = cornerCheckPoints(basePoly, c.vertexIdx, c);
+                    }
+                }
+                const v0p = convAbs(checkAt[0] ? checkAt[0].B : verts[0].pout);
                 ctx.moveTo(v0p[0], v0p[1]);
                 for (let i = 0; i < n; i++) {
-                    const nv = verts[(i+1)%n];
-                    const pinC = convAbs(nv.pin);
-                    ctx.lineTo(pinC[0], pinC[1]);
-                    if (nv.t > 0) {
-                        if (nv.r === 0) {
-                            const poutC = convAbs(nv.pout);
-                            ctx.lineTo(poutC[0], poutC[1]);
-                        } else {
-                            const currC = convAbs(nv.curr);
-                            const poutC = convAbs(nv.pout);
-                            ctx.arcTo(currC[0], currC[1], poutC[0], poutC[1], nv.r / INCH * sc);
+                    const nextI = (i+1)%n;
+                    const nv = verts[nextI];
+                    const nvCk = checkAt[nextI];
+                    if (nvCk) {
+                        const A = convAbs(nvCk.A), C = convAbs(nvCk.C), B = convAbs(nvCk.B);
+                        ctx.lineTo(A[0], A[1]);
+                        ctx.lineTo(C[0], C[1]);
+                        ctx.lineTo(B[0], B[1]);
+                    } else {
+                        const pinC = convAbs(nv.pin);
+                        ctx.lineTo(pinC[0], pinC[1]);
+                        if (nv.t > 0) {
+                            if (nv.r === 0) {
+                                const poutC = convAbs(nv.pout);
+                                ctx.lineTo(poutC[0], poutC[1]);
+                            } else {
+                                const currC = convAbs(nv.curr);
+                                const poutC = convAbs(nv.pout);
+                                ctx.arcTo(currC[0], currC[1], poutC[0], poutC[1], nv.r / INCH * sc);
+                            }
                         }
                     }
                 }
@@ -7634,8 +8188,10 @@ function slabDrawSlab(ctx, sd, idx, ox, oy, sc, mockupMode) {
             } else if (shapeType === 'circle') {
                 const r = pxw / 2;
                 ctx.arc(px + r, py + r, r, 0, Math.PI * 2);
-            } else if (shape && shape.farmSink && p.ref.segIdx == null) {
-                // Rect with farmhouse sink — use polygon path with rotation
+            } else if (shape && p.ref.segIdx == null && (shape.farmSink || (shape.checks || []).length > 0)) {
+                // Rect with farmhouse sink OR corner-check notches — use
+                // shapeLocalPolyInches so the piece outline matches the
+                // true cut shape.
                 const poly = shapeLocalPolyInches(shape);
                 const pts = poly.map(([lx, ly]) => {
                     switch(rot) {
@@ -8021,23 +8577,20 @@ document.addEventListener('keydown', e => {
 });
 
 function calcPageSqft(page) {
+    // Gross countertop sqft — matches the pricing tab's billable calculation.
+    // Cutouts (sinks, cooktops, outlets, bocci) are NOT subtracted: you still pay
+    // for the slab area around them. Farmhouse sinks remain subtracted because they
+    // live at the edge of the slab and are handled as a property on the main shape.
     let total = 0;
     for (const s of page.shapes) {
-        if (s.subtype === 'sink_overmount' || s.subtype === 'sink_undermount' || s.subtype === 'sink_vasque' || s.subtype === 'cooktop') {
-            // Subtract cutout area from slab
-            total -= s.w * s.h;
-        } else if (s.subtype === 'outlet') {
-            total -= s.w * s.h;
-        } else if (s.subtype === 'bocci') {
-            total -= Math.PI * (s.w / 2) * (s.w / 2);
-        } else {
-            let area = s.w * s.h;
-            if (s.shapeType === 'l') area -= (s.notchW||0) * (s.notchH||0);
-            if (s.shapeType === 'u') area = uShapeAreaPx(s);
-            if (s.shapeType === 'circle') area = Math.PI * (s.w / 2) * (s.h / 2);
-                if (s.farmSink) area -= (FS_WIDTH_IN * INCH) * (FS_DEPTH_IN * INCH);
-            total += area;
-        }
+        if (s.subtype) continue;  // skip sink/cooktop/outlet/bocci cutout shapes
+        let area = s.w * s.h;
+        if (s.shapeType === 'l') area -= (s.notchW||0) * (s.notchH||0);
+        if (s.shapeType === 'u') area = uShapeAreaPx(s);
+        if (s.shapeType === 'circle') area = Math.PI * (s.w / 2) * (s.h / 2);
+        if (s.farmSink) area -= (FS_WIDTH_IN * INCH) * (FS_DEPTH_IN * INCH);
+        area -= totalCheckAreaPx(s);
+        total += area;
     }
     return Math.max(0, total) / SQFT_PX2;
 }
@@ -8144,14 +8697,21 @@ function calcPagePricing(page) {
         (m.type||'page') === 'page' && m.pageId === page.id
     );
 
-    // Material + cutting (per-material cutting rate, Dekton vs regular)
+    // Material + cutting — slab-based (matches pricing tab; respects user slab overrides)
     let matCost = 0, cutCost = 0, cutRate = 0;
     let isDekton = false;
     if (pageMat && roomSqft > 0) {
         isDekton = (pageMat.supplier||'').toLowerCase().includes('dekton')
                 || (pageMat.color   ||'').toLowerCase().includes('dekton')
                 || (pageMat.thickness||'').toLowerCase().includes('dekton');
-        matCost = roomSqft * getMatPriceSqft(pageMat.id);
+        const dbCostPerSlab = getMatCostPerSlab(pageMat.id);
+        const slabSqft = getMatSlabSqft(pageMat.id);
+        const suggestedQty = slabSqft > 0 ? Math.ceil(roomSqft / slabSqft) : 1;
+        const ov = (pricingData.slabOverrides||{})[pageMat.id] || {};
+        const slabQty = ov.qty != null ? ov.qty : suggestedQty;
+        const useCustom = ov.customPrice != null && ov.customPrice >= 0;
+        const pricePerSlab = useCustom ? ov.customPrice : dbCostPerSlab;
+        matCost = slabQty * pricePerSlab;
         cutRate = isDekton ? (pricingData.rates.dektonCoupe||0) : (pricingData.rates.coupe||0);
         cutCost = roomSqft * cutRate;
     }
@@ -8185,6 +8745,7 @@ function calcPagePricing(page) {
     };
 }
 
+// Project-wide fees applied once (not attributable to a single page)
 // Per-page pricing for all linked materials (multi-option pages).
 // Returns shared page services + an options[] array, one entry per linked material.
 // If 2+ materials are linked to the same page, they are treated as options the
@@ -8223,6 +8784,7 @@ function calcPageOptions(page) {
         const isDekton = (mat.supplier||'').toLowerCase().includes('dekton')
                       || (mat.color   ||'').toLowerCase().includes('dekton')
                       || (mat.thickness||'').toLowerCase().includes('dekton');
+        // Slab-based material cost (matches buildMatBlock in renderPricingPanel)
         const dbCostPerSlab = getMatCostPerSlab(mat.id);
         const slabSqft = getMatSlabSqft(mat.id);
         const suggestedQty = slabSqft > 0 ? Math.ceil(roomSqft / slabSqft) : 1;
@@ -8231,6 +8793,7 @@ function calcPageOptions(page) {
         const useCustom = ov.customPrice != null && ov.customPrice >= 0;
         const pricePerSlab = useCustom ? ov.customPrice : dbCostPerSlab;
         const matCost = slabQty * pricePerSlab;
+        // Cutting (same formula across both views)
         const cutRate = isDekton ? (pricingData.rates.dektonCoupe||0) : (pricingData.rates.coupe||0);
         const cutCost = roomSqft * cutRate;
         const optionSubtotal = matCost + cutCost + servicesCost;
@@ -8273,7 +8836,6 @@ function calcAllCombinations() {
     return { combos, pageOptionsList };
 }
 
-// Project-wide fees applied once (not attributable to a single page)
 function calcProjectFees() {
     let totalSqft = 0;
     for (const page of pages) totalSqft += calcPageSqft(page);
@@ -8373,6 +8935,7 @@ function calcOptionsSummary() {
             if (s.shapeType === 'u')      area  = uShapeAreaPx(s);
             if (s.shapeType === 'circle') area  = Math.PI * (s.w/2) * (s.h/2);
             if (s.farmSink)               area -= (FS_WIDTH_IN * INCH) * (FS_DEPTH_IN * INCH);
+            area -= totalCheckAreaPx(s);
             totalSqft += area / SQFT_PX2;
         }
     }
@@ -8380,10 +8943,9 @@ function calcOptionsSummary() {
     const serviceItems = getServiceLineItems().filter(i => i.key !== 'coupe' && i.key !== 'dektonCoupe');
     const sharedServices = serviceItems.reduce((s, i) => s + i.cost, 0);
 
-    // Shared committed material cost — Page-type materials are added to every Option scenario
+    // Shared committed material cost — Page-type materials added to every whole-project Option scenario.
+    // Uses the SAME slab-based math as the pricing tab (respects user slab qty/price overrides).
     let sharedCommittedMat = 0;
-    // Page-type materials are "fixed" baselines added to each Option scenario:
-    // each linked page contributes (page sqft × $/sqft) + cutting to the shared baseline.
     for (const page of pages) {
         const pageMat = (formData.materials||[]).find(mm =>
             (mm.type||'page') === 'page' && mm.pageId === page.id
@@ -8394,8 +8956,14 @@ function calcOptionsSummary() {
         const isDekton = (pageMat.supplier||'').toLowerCase().includes('dekton') ||
                          (pageMat.color||'').toLowerCase().includes('dekton') ||
                          (pageMat.thickness||'').toLowerCase().includes('dekton');
-        const pps = getMatPriceSqft(pageMat.id);
-        const matCost = pSqft * pps;
+        const dbCostPerSlab = getMatCostPerSlab(pageMat.id);
+        const slabSqft = getMatSlabSqft(pageMat.id);
+        const suggestedQty = slabSqft > 0 ? Math.ceil(pSqft / slabSqft) : 1;
+        const ov = (pricingData.slabOverrides||{})[pageMat.id] || {};
+        const slabQty = ov.qty != null ? ov.qty : suggestedQty;
+        const useCustom = ov.customPrice != null && ov.customPrice >= 0;
+        const pricePerSlab = useCustom ? ov.customPrice : dbCostPerSlab;
+        const matCost = slabQty * pricePerSlab;
         const cutRate = isDekton ? (pricingData.rates.dektonCoupe||0) : (pricingData.rates.coupe||0);
         sharedCommittedMat += matCost + pSqft * cutRate;
     }
@@ -8625,8 +9193,8 @@ function generateProposal() {
     selected = null; selectedDiag = null; selectedText = null; selectedJoint = null;
     hovCorner = null; hovEdge = null;
 
-    // Collect per-page pricing for the final summary (now option-aware)
-    const pageOptionsByPage = []; // array of po objects (calcPageOptions output)
+    // Collect per-page pricing for the final summary
+    const pageOptionsByPage = []; // array of po objects
 
     // Project-level fees (install + measurements + polissage) are allocated into
     // each page proportionally by sqft so they appear up-front in the room breakdown.
@@ -8656,18 +9224,15 @@ function generateProposal() {
         const { roomSqft, edgeFootage, sinks, options } = po;
         const contentH = panelContentH(po);
 
-        // Fixed zones: image always left 364pt, panel always right 148pt
-        const IMG_ZONE_W = CW - PANEL_W - 10; // 364pt
+        const IMG_ZONE_W = CW - PANEL_W - 10;
         const MAX_IMG_H  = 200;
         const scale = Math.min(IMG_ZONE_W / natW, MAX_IMG_H / natH);
         const imgW = natW * scale, imgH = natH * scale;
         const panelH = Math.max(imgH, contentH);
         const totalBlockH = 24 + panelH + 20;
-
-        // Ensure the entire block stays on one page
         if (y + totalBlockH > PH - FOOTER_H - 10) newPdfPage();
 
-        // Section header — French bold, English small italic on line below
+        // Section header
         doc.setFont('helvetica','bold'); doc.setFontSize(9.5); doc.setTextColor(...BRAND);
         doc.text(`DISPOSITION — ${page.name.toUpperCase()}`, ML, y);
         doc.setFont('helvetica','italic'); doc.setFontSize(7); doc.setTextColor(120,100,50);
@@ -8676,13 +9241,12 @@ function generateProposal() {
         doc.line(ML, y + 11, PW-MR, y + 11);
         y += 20;
 
-        // Center image horizontally within its fixed zone
+        // Image
         const imgX = ML + Math.floor((IMG_ZONE_W - imgW) / 2);
-        // Center image vertically within panel height
         const imgY = y + Math.floor((panelH - imgH) / 2);
         doc.addImage(imgData, 'PNG', imgX, imgY, imgW, imgH);
 
-        // Panel — always fixed position and width
+        // Panel
         const px = ML + IMG_ZONE_W + 10, pw = PANEL_W;
         doc.setFillColor(...TBL_BG);
         doc.rect(px, y, pw, panelH, 'F');
@@ -8691,7 +9255,7 @@ function generateProposal() {
 
         let py2 = y + 12;
 
-        // Room name header (with multi-option indicator)
+        // Room name header
         doc.setFont('helvetica','bold'); doc.setFontSize(8); doc.setTextColor(...BRAND);
         doc.text(page.name.toUpperCase() + (options.length > 1 ? ` · ${options.length} OPTIONS` : ''), px + pw/2, py2, {align:'center'});
         py2 += 5;
@@ -8730,7 +9294,7 @@ function generateProposal() {
             doc.line(px+5, py2, px+pw-5, py2); py2 += 7;
         }
 
-        // ── Sink / cooktop services (counts, shared across options) ──
+        // ── Sink / cooktop services (shared across options) ──
         // Installation / measurements / polissage are NOT itemized here — they are
         // rolled silently into each option's pre-tax subtotal (see po.servicesCost
         // += feeShare.total above). The subtotal label calls this out so the
@@ -9027,7 +9591,7 @@ function generateProposal() {
     doc.text('All prices include GST (5%) and QST (9.975%).', ML, y, {maxWidth:CW});
     y += 12;
 
-    const fname = `MND-${(formData.order||'000').replace(/[^a-zA-Z0-9_-]/g,'-')}_Proposal_${(formData.client||'Client').replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_-]/g,'')}.pdf`;
+    const fname = `SI-${(formData.order||'000').replace(/[^a-zA-Z0-9_-]/g,'-')}_Proposal_${(formData.client||'Client').replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_-]/g,'')}.pdf`;
     doc.save(fname);
 }
 
@@ -9040,7 +9604,7 @@ document.getElementById('btn-gen-proposal').addEventListener('click', generatePr
 function quoteFilename(ext) {
     const order = (formData.order || 'XXXX').replace(/[^a-zA-Z0-9_-]/g, '-');
     const job   = (formData.job   || 'Quote').replace(/[^a-zA-Z0-9_-]/g, '_');
-    return `MND-${order}_${job}.${ext}`;
+    return `SI-${order}_${job}.${ext}`;
 }
 
 // ── Save Quote ────────────────────────────────────────────────
@@ -9049,8 +9613,10 @@ async function saveQuote() {
     const r = await saveQuoteToDb();
     regUpdateCurrentBanner();
     if (r && r.ok) {
+        // saveQuoteToDb already shows the status toast; no modal alert needed.
         if (r.restored) alert('Quote row was missing — recreated under the same id. A backup copy is safe.');
     } else {
+        // saveQuoteToDb already downloaded a JSON backup and showed an error toast.
         alert('Cloud save failed: ' + ((r && r.error) || 'unknown') + '\nA JSON backup was downloaded to keep your work safe.');
     }
 }
@@ -9154,8 +9720,9 @@ document.getElementById('load-file-input').addEventListener('change', function(e
 function newQuote() {
     if (!confirm('Start a new quote? All current canvas and form data will be cleared.')) return;
     console.log('[newQuote] resetting — was editing:', currentQuoteId);
-    // CRITICAL: clear the quote-id pointer FIRST. Without this, the next save
-    // would UPDATE the previous quote row instead of creating a new one.
+    // CRITICAL: clear the quote-id pointer FIRST. Without this, the next
+    // save would UPDATE the previous quote row instead of creating a new one
+    // ("stacking"/"saves over the last one").
     currentQuoteId = null;
     localStorage.removeItem('mondial_currentQuoteId');
     pages = [{ id:1, name:'Page 1', shapes:[], textItems:[], nextId:1, _undo:[] }];
@@ -9203,7 +9770,7 @@ function exportPDF() {
     const CW       = PW - ML - MR;
     const FOOTER_H = 54;
     // ── Brand palette (RGB) ──
-    const BRAND  = [61, 90, 104];   // #3d5a68 — Mondial army olive
+    const BRAND  = [61, 90, 104];   // #3d5a68 — Mondial slate
     const ACCENT = [95, 184, 194];   // #5fb8c2 — warm khaki/gold
     const TBL_BG = [240, 237, 216];  // warm parchment table rows
     const BODY_T = [38,  32,  12];   // warm near-black body text
@@ -9247,14 +9814,23 @@ function exportPDF() {
         doc.text('MONDIAL', PW / 2, PH - 19, { align:'center' });
     }
 
-    // ── Header banner (Mondial slate blue-grey) ────────────────
+    // ── Header banner (army olive) ────────────────────────────
     doc.setFillColor(...BRAND);
     doc.rect(0, 0, PW, 70, 'F');
-    // teal accent stripe at bottom
+    // khaki accent stripe at bottom
     doc.setFillColor(...ACCENT);
     doc.rect(0, 68, PW, 2.5, 'F');
-    // Logo image (left side — wide horizontal logo)
-    doc.addImage(LOGO_DATA_URL, 'PNG', ML, 6, 130, 56);
+    // Logo image (left side)
+    doc.addImage(LOGO_DATA_URL, 'PNG', ML, 8, 48, 48);
+    // Company name + tagline (offset right of logo)
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(17);
+    doc.setTextColor(255, 255, 255);
+    doc.text('MONDIAL', ML + 58, 30);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    doc.setTextColor(...ACCENT);
+    doc.text('Countertop Quote', ML + 58, 48);
     // right side — order & date
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(9);
@@ -9484,7 +10060,15 @@ async function exportLayoutPDF() {
         doc.rect(0, 0, PW, 70, 'F');
         doc.setFillColor(...ACCENT);
         doc.rect(0, 68, PW, 2.5, 'F');
-        doc.addImage(LOGO_DATA_URL, 'PNG', ML, 6, 130, 56);
+        doc.addImage(LOGO_DATA_URL, 'PNG', ML, 8, 48, 48);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(17);
+        doc.setTextColor(255, 255, 255);
+        doc.text('MONDIAL', ML + 58, 30);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9);
+        doc.setTextColor(...ACCENT);
+        doc.text(subtitle || 'Layout Overview', ML + 58, 48);
         doc.setFont('helvetica', 'bold');
         doc.setFontSize(9);
         doc.setTextColor(255, 255, 255);
@@ -9682,7 +10266,7 @@ async function exportLayoutPDF() {
     }
 
     // ── Save ─────────────────────────────────────────────────
-    const fname = `MND-${(formData.order||'000').replace(/[^a-zA-Z0-9_-]/g,'-')}_Layout_${(formData.client||'Client').replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_-]/g,'')}.pdf`;
+    const fname = `SI-${(formData.order||'000').replace(/[^a-zA-Z0-9_-]/g,'-')}_Layout_${(formData.client||'Client').replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_-]/g,'')}.pdf`;
     doc.save(fname);
 }
 
@@ -10168,14 +10752,18 @@ function kitBuildPath(ctx, p, px, py, sc, rotOverride) {
         for(let i=1;i<pts.length;i++) ctx.lineTo(px+pts[i][0]*sc,py+pts[i][1]*sc);
         ctx.closePath();
     } else if (st==='l'&&shape&&p.ref.segIdx==null) {
-        const verts=lShapeVerts(shape),n=verts.length;
-        const v0=convAbs(verts[0].pout); ctx.moveTo(v0[0],v0[1]);
-        for(let i=0;i<n;i++){const nv=verts[(i+1)%n],pin=convAbs(nv.pin);ctx.lineTo(pin[0],pin[1]);if(nv.t>0){if(nv.r===0){const po=convAbs(nv.pout);ctx.lineTo(po[0],po[1]);}else{const cu=convAbs(nv.curr),po=convAbs(nv.pout);ctx.arcTo(cu[0],cu[1],po[0],po[1],nv.r/INCH*sc);}}}
+        const verts=lShapeVerts(shape),basePoly=lShapePolygon(shape),n=verts.length;
+        const checkAt=new Array(n).fill(null);
+        for(const c of (shape.checks||[])){if(c.vertexIdx!=null&&c.vertexIdx>=0&&c.vertexIdx<n)checkAt[c.vertexIdx]=cornerCheckPoints(basePoly,c.vertexIdx,c);}
+        const v0=convAbs(checkAt[0]?checkAt[0].B:verts[0].pout); ctx.moveTo(v0[0],v0[1]);
+        for(let i=0;i<n;i++){const nextI=(i+1)%n,nv=verts[nextI],nvCk=checkAt[nextI];if(nvCk){const A=convAbs(nvCk.A),C=convAbs(nvCk.C),B=convAbs(nvCk.B);ctx.lineTo(A[0],A[1]);ctx.lineTo(C[0],C[1]);ctx.lineTo(B[0],B[1]);}else{const pin=convAbs(nv.pin);ctx.lineTo(pin[0],pin[1]);if(nv.t>0){if(nv.r===0){const po=convAbs(nv.pout);ctx.lineTo(po[0],po[1]);}else{const cu=convAbs(nv.curr),po=convAbs(nv.pout);ctx.arcTo(cu[0],cu[1],po[0],po[1],nv.r/INCH*sc);}}}}
         ctx.closePath();
     } else if (st==='u'&&shape&&p.ref.segIdx==null) {
-        const verts=uShapeVerts(shape),n=verts.length;
-        const v0=convAbs(verts[0].pout); ctx.moveTo(v0[0],v0[1]);
-        for(let i=0;i<n;i++){const nv=verts[(i+1)%n],pin=convAbs(nv.pin);ctx.lineTo(pin[0],pin[1]);if(nv.t>0){if(nv.r===0){const po=convAbs(nv.pout);ctx.lineTo(po[0],po[1]);}else{const cu=convAbs(nv.curr),po=convAbs(nv.pout);ctx.arcTo(cu[0],cu[1],po[0],po[1],nv.r/INCH*sc);}}}
+        const verts=uShapeVerts(shape),basePoly=uShapePolygon(shape),n=verts.length;
+        const checkAt=new Array(n).fill(null);
+        for(const c of (shape.checks||[])){if(c.vertexIdx!=null&&c.vertexIdx>=0&&c.vertexIdx<n)checkAt[c.vertexIdx]=cornerCheckPoints(basePoly,c.vertexIdx,c);}
+        const v0=convAbs(checkAt[0]?checkAt[0].B:verts[0].pout); ctx.moveTo(v0[0],v0[1]);
+        for(let i=0;i<n;i++){const nextI=(i+1)%n,nv=verts[nextI],nvCk=checkAt[nextI];if(nvCk){const A=convAbs(nvCk.A),C=convAbs(nvCk.C),B=convAbs(nvCk.B);ctx.lineTo(A[0],A[1]);ctx.lineTo(C[0],C[1]);ctx.lineTo(B[0],B[1]);}else{const pin=convAbs(nv.pin);ctx.lineTo(pin[0],pin[1]);if(nv.t>0){if(nv.r===0){const po=convAbs(nv.pout);ctx.lineTo(po[0],po[1]);}else{const cu=convAbs(nv.curr),po=convAbs(nv.pout);ctx.arcTo(cu[0],cu[1],po[0],po[1],nv.r/INCH*sc);}}}}
         ctx.closePath();
     } else if (st==='bsp'&&shape&&p.ref.segIdx==null) {
         const pts=bspPolygon(shape),f=convAbs(pts[0]);ctx.moveTo(f[0],f[1]);
@@ -10183,6 +10771,13 @@ function kitBuildPath(ctx, p, px, py, sc, rotOverride) {
         ctx.closePath();
     } else if (st==='circle') {
         const{w:ppw}=slabGetPieceWH(p.ref,rot);const r=ppw*sc/2;ctx.arc(px+r,py+r,r,0,Math.PI*2);
+    } else if (shape&&p.ref.segIdx==null&&(shape.farmSink||(shape.checks||[]).length>0)) {
+        // Rect with farm sink OR corner checks — use the notched polygon
+        const poly=shapeLocalPolyInches(shape);
+        const pts=poly.map(([lx,ly])=>{switch(rot){case 1:return[hi_in-ly,lx];case 2:return[wi_in-lx,hi_in-ly];case 3:return[ly,wi_in-lx];default:return[lx,ly];}});
+        ctx.moveTo(px+pts[0][0]*sc,py+pts[0][1]*sc);
+        for(let i=1;i<pts.length;i++)ctx.lineTo(px+pts[i][0]*sc,py+pts[i][1]*sc);
+        ctx.closePath();
     } else {
         const r=shape?shapeRadii(shape):{nw:0,ne:0,se:0,sw:0};
         const ch=shape?shapeChamfers(shape):{nw:0,ne:0,se:0,sw:0};
@@ -10654,7 +11249,11 @@ async function kitExportPDF() {
     const BRAND = [61, 90, 104], ACCENT = [95, 184, 194];
     doc.setFillColor(...BRAND); doc.rect(0, 0, PW, 70, 'F');
     doc.setFillColor(...ACCENT); doc.rect(0, 68, PW, 2.5, 'F');
-    doc.addImage(LOGO_DATA_URL, 'PNG', ML, 6, 130, 56);
+    doc.addImage(LOGO_DATA_URL, 'PNG', ML, 8, 48, 48);
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor(255, 255, 255);
+    doc.text('MONDIAL', ML + 58, 30);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...ACCENT);
+    doc.text('Stone Simulation — Kitchen Layout', ML + 58, 48);
     doc.setFont('helvetica', 'bold'); doc.setFontSize(9); doc.setTextColor(255, 255, 255);
     doc.text(`Quote #: ${formData.order || '—'}`, PW - MR, 30, { align: 'right' });
     doc.setFont('helvetica', 'normal'); doc.setTextColor(...ACCENT);
@@ -10682,7 +11281,7 @@ async function kitExportPDF() {
     const maxH = PH - FOOTER_H - y - 20;
     const sc2 = Math.min(CW / offW, maxH / offH);
     doc.addImage(imgData, 'JPEG', ML + (CW - offW * sc2) / 2, y, offW * sc2, offH * sc2);
-    const fname = `MND-${(formData.order || '000').replace(/[^a-zA-Z0-9_-]/g, '-')}_Kitchen_${(formData.client || 'Client').replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '')}.pdf`;
+    const fname = `SI-${(formData.order || '000').replace(/[^a-zA-Z0-9_-]/g, '-')}_Kitchen_${(formData.client || 'Client').replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_-]/g, '')}.pdf`;
     doc.save(fname);
 }
 
