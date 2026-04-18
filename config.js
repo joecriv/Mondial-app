@@ -1,8 +1,6 @@
 // Per-shop branding — MONDIAL
 const BRAND = {
 
-    accessCode:   'Thenry12',
-
     companyName:  'MONDIAL',
     tagline:      '',
 
