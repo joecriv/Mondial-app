@@ -5015,6 +5015,7 @@ document.getElementById('btn-undo').addEventListener('click', undo);
 // ─────────────────────────────────────────────────────────────
 const FORM_KEY    = 'mondial_form';
 const PRICING_KEY = 'mondial_pricing';
+const RATES_KEY = 'mondial_rates';
 const MATDB_KEY   = 'mondial_matdb';
 let formData = { order:'', job:'', client:'', address:'', phones:[''], date:'', notes:'', materials:[] };
 let matNextId = 1;
@@ -5818,7 +5819,22 @@ function fmt$(v) {
 
 function savePricing() {
     localStorage.setItem(PRICING_KEY, JSON.stringify(pricingData));
+    if (pricingData.rates) localStorage.setItem(RATES_KEY, JSON.stringify(pricingData.rates));
     scheduleSyncToRemote();
+}
+
+function getSavedRates() {
+    try {
+        const r = JSON.parse(localStorage.getItem(RATES_KEY));
+        if (r && typeof r === 'object') {
+            const merged = { ...DEFAULT_RATES };
+            for (const k of Object.keys(DEFAULT_RATES)) {
+                if (r[k] !== undefined) merged[k] = r[k];
+            }
+            return merged;
+        }
+    } catch (_) {}
+    return { ...DEFAULT_RATES };
 }
 
 function loadPricing() {
@@ -5826,12 +5842,13 @@ function loadPricing() {
         const d = JSON.parse(localStorage.getItem(PRICING_KEY));
         if (d && d.rates) {
             pricingData = d;
-            // Ensure all new rate keys exist
             for (const [k,v] of Object.entries(DEFAULT_RATES)) {
                 if (pricingData.rates[k] === undefined) pricingData.rates[k] = v;
             }
             if (!pricingData.materialPrices) pricingData.materialPrices = {};
             if (pricingData.polissageSousQty === undefined) pricingData.polissageSousQty = 0;
+        } else {
+            pricingData.rates = getSavedRates();
         }
     } catch(e) {}
 }
@@ -10082,9 +10099,8 @@ document.getElementById('load-file-input').addEventListener('change', function(e
                     pricingData = pd;
                     if (!pricingData.materialPrices) pricingData.materialPrices = {};
                 } else {
-                    // Old format — keep defaults, don't crash
                     pricingData = {
-                        rates: { ...DEFAULT_RATES },
+                        rates: getSavedRates(),
                         materialPrices: {},
                     };
                 }
@@ -10137,7 +10153,7 @@ function newQuote() {
     document.getElementById('f-notes').value  = '';
     renderMaterials();
     pricingData = {
-        rates: { ...DEFAULT_RATES },
+        rates: getSavedRates(),
         materialPrices: {},
     };
     pricingNextId = 1;
