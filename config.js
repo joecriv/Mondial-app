@@ -24,6 +24,11 @@ const BRAND = {
     // Hardcoded shop ID — locks this deployment to Mondial only
     shopId: '2d11bb5e-7acf-46fc-9d89-d251b781a35e',
 
+    // Default password to unlock the Costs panel. Owners can override it
+    // in-app (Change password button when unlocked) — that override is
+    // saved per-device in localStorage.
+    costsLockPassword: 'mondial2026',
+
 };
 
 if (typeof window !== 'undefined') { window.BRAND = BRAND; }
