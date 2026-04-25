@@ -10772,7 +10772,6 @@ function exportPDF() {
     doc.setFillColor(...ACCENT);
     doc.rect(0, 68, PW, 2.5, 'F');
     // Logo image (left side)
-    doc.addImage(LOGO_DATA_URL, 'PNG', ML, 8, 48, 48);
     // Company name + tagline (offset right of logo)
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(17);
@@ -12212,7 +12211,6 @@ async function kitExportPDF() {
     const BRAND = [61, 90, 104], ACCENT = [95, 184, 194];
     doc.setFillColor(...BRAND); doc.rect(0, 0, PW, 70, 'F');
     doc.setFillColor(...ACCENT); doc.rect(0, 68, PW, 2.5, 'F');
-    doc.addImage(LOGO_DATA_URL, 'PNG', ML, 8, 48, 48);
     doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor(255, 255, 255);
     doc.text('MONDIAL', ML + 58, 30);
     doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...ACCENT);
