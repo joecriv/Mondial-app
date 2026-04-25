@@ -3634,18 +3634,45 @@ document.getElementById('joint-btn-d').addEventListener('click', () => {
     _setJointBtnActive('d');
 });
 
+// Returns the polygon vertex along the corner's inward bisector — the
+// natural miter direction pointing into the polygon material.
 function findClosestDiagonalVertex(s, snapCorner) {
     const poly = (s.shapeType === 'l') ? lShapePolygon(s)
               : (s.shapeType === 'u') ? uShapePolygon(s)
               : (s.shapeType === 'bsp') ? bspPolygon(s)
               : [[s.x, s.y], [s.x+s.w, s.y], [s.x+s.w, s.y+s.h], [s.x, s.y+s.h]];
     const eps = 0.5;
-    let best = null, bestD = Infinity;
+    let snapIdx = -1;
+    for (let i = 0; i < poly.length; i++) {
+        if (Math.abs(poly[i][0] - snapCorner.x) < eps && Math.abs(poly[i][1] - snapCorner.y) < eps) {
+            snapIdx = i; break;
+        }
+    }
+    if (snapIdx < 0) return null;
+    const n = poly.length;
+    const prev = poly[(snapIdx - 1 + n) % n];
+    const cur  = poly[snapIdx];
+    const next = poly[(snapIdx + 1) % n];
+    const ix = cur[0] - prev[0], iy = cur[1] - prev[1];
+    const ox = next[0] - cur[0], oy = next[1] - cur[1];
+    const iLen = Math.hypot(ix, iy) || 1;
+    const oLen = Math.hypot(ox, oy) || 1;
+    const inN  = [-iy / iLen,  ix / iLen];
+    const outN = [-oy / oLen,  ox / oLen];
+    let bx = inN[0] + outN[0];
+    let by = inN[1] + outN[1];
+    const bLen = Math.hypot(bx, by);
+    if (bLen < 1e-6) return null;
+    bx /= bLen; by /= bLen;
+    let best = null, bestDot = -2;
     for (const [px, py] of poly) {
         if (Math.abs(px - snapCorner.x) < eps && Math.abs(py - snapCorner.y) < eps) continue;
         if (Math.abs(px - snapCorner.x) < eps || Math.abs(py - snapCorner.y) < eps) continue;
-        const d = Math.hypot(px - snapCorner.x, py - snapCorner.y);
-        if (d < bestD) { bestD = d; best = [px, py]; }
+        const dx = px - snapCorner.x, dy = py - snapCorner.y;
+        const dLen = Math.hypot(dx, dy);
+        if (dLen < eps) continue;
+        const dot = (dx / dLen) * bx + (dy / dLen) * by;
+        if (dot > bestDot) { bestDot = dot; best = [px, py]; }
     }
     return best ? { x: best[0], y: best[1] } : null;
 }
