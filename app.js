@@ -9478,11 +9478,19 @@ function slabDrawSlab(ctx, sd, idx, ox, oy, sc, mockupMode) {
         }
         ctx.stroke();
         ctx.setLineDash([]);
-        slabRemnantPoints.forEach(p => {
-            ctx.fillStyle = '#ffe080';
+        slabRemnantPoints.forEach((p, i) => {
+            const isFirst = (i === 0);
+            const r = isFirst && slabRemnantPoints.length >= 3 ? 7 : 4;
+            ctx.fillStyle = isFirst ? '#ffd060' : '#ffe080';
             ctx.beginPath();
-            ctx.arc(ox + dz + p.x * sc, oy + dz + p.y * sc, 4, 0, Math.PI * 2);
+            ctx.arc(ox + dz + p.x * sc, oy + dz + p.y * sc, r, 0, Math.PI * 2);
             ctx.fill();
+            if (isFirst && slabRemnantPoints.length >= 3) {
+                ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                ctx.arc(ox + dz + p.x * sc, oy + dz + p.y * sc, 9, 0, Math.PI * 2);
+                ctx.stroke();
+            }
         });
         ctx.restore();
     }
@@ -9595,6 +9603,20 @@ if (slabCanvas) {
         if (slabRemnantMode) {
             const L = slabFindLayoutAt(mx, my);
             if (!L) return;
+            if (slabRemnantPoints.length >= 3 && slabRemnantSlabIdx === L.idx) {
+                const f = slabRemnantPoints[0];
+                const fx = L.ox + L.dz + f.x * L.sc;
+                const fy = L.oy + L.dz + f.y * L.sc;
+                if (Math.hypot(mx - fx, my - fy) <= 12) {
+                    const sd = slabDefs[slabRemnantSlabIdx];
+                    if (!sd.remnants) sd.remnants = [];
+                    sd.remnants.push({ poly: slabRemnantPoints.slice() });
+                    slabRemnantPoints = [];
+                    slabRemnantSlabIdx = null;
+                    slabRender();
+                    return;
+                }
+            }
             const x = (mx - L.ox - L.dz) / L.sc;
             const y = (my - L.oy - L.dz) / L.sc;
             if (slabRemnantPoints.length === 0) {
@@ -9604,13 +9626,6 @@ if (slabCanvas) {
             }
             if (slabPointOverPiece(L.idx, x, y)) return;
             slabRemnantPoints.push({ x, y });
-            if (slabRemnantPoints.length === 4) {
-                const sd = slabDefs[slabRemnantSlabIdx];
-                if (!sd.remnants) sd.remnants = [];
-                sd.remnants.push({ poly: slabRemnantPoints.slice() });
-                slabRemnantPoints = [];
-                slabRemnantSlabIdx = null;
-            }
             slabRender();
             return;
         }
@@ -9806,6 +9821,17 @@ document.addEventListener('keydown', e => {
         } else {
             slabSetRemnantMode(false);
         }
+    }
+    if (e.key === 'Enter' && slabRemnantMode && slabRemnantPoints.length >= 3 && !e.target.closest('input,textarea,select')) {
+        const sd = slabDefs[slabRemnantSlabIdx];
+        if (sd) {
+            if (!sd.remnants) sd.remnants = [];
+            sd.remnants.push({ poly: slabRemnantPoints.slice() });
+        }
+        slabRemnantPoints = [];
+        slabRemnantSlabIdx = null;
+        slabRender();
+        e.preventDefault();
     }
     if ((e.key === 'Delete' || e.key === 'Backspace') && slabSelected && !e.target.closest('input,textarea,select')) {
         slabPlaced = slabPlaced.filter(p => p.id !== slabSelected);
