@@ -5319,6 +5319,10 @@ cv.addEventListener('dblclick', e => {
 // ─────────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
     if (currentPopup) return;
+    {
+        const slabPanel = document.getElementById('slab-panel');
+        if (slabPanel && slabPanel.style.display !== 'none') return;
+    }
     if (e.ctrlKey && e.key === 'z') { e.preventDefault(); undo(); return; }
     if (e.key === 'Delete' || e.key === 'Backspace') {
         if (selectedJoint && document.activeElement === document.body) {
@@ -10129,6 +10133,14 @@ document.addEventListener('keydown', e => {
         slabSelected = null;
         slabRefreshPieceList();
         slabRender();
+    }
+    if ((e.key === 'r' || e.key === 'R') && slabSelected && !e.target.closest('input,textarea,select')) {
+        const sp = slabPlaced.find(pl => pl.id === slabSelected);
+        if (sp) {
+            sp.rotation = ((sp.rotation || 0) + 1) % 4;
+            slabRender();
+            e.preventDefault();
+        }
     }
     if ((e.key === 'Delete' || e.key === 'Backspace') && slabRemnantSelected && !e.target.closest('input,textarea,select')) {
         const sel = slabRemnantSelected;
