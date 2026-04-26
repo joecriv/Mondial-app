@@ -922,6 +922,43 @@ function clearStaleFsHalves(s) {
         if (e && (e.fsLeft || e.fsRight)) { delete e.fsLeft; delete e.fsRight; }
     }
 }
+function fsCaptureWorld(s) {
+    if (!s.farmSink) return null;
+    const fr = farmSinkRectAbs(s);
+    if (!fr) return null;
+    if (fr.vertical) return { wx: fr.segXAbs, wy: fr.cyAbs };
+    return { wx: fr.cxAbs, wy: fr.segYAbs };
+}
+function fsRestoreWorld(s, snap) {
+    if (!s.farmSink || !snap) return;
+    const fs = s.farmSink;
+    const fsW = FS_WIDTH_IN * INCH;
+    const halfW = fsW / 2;
+    if (fs.edge === 'top' || fs.edge === 'bottom') {
+        fs.cx = Math.max(halfW, Math.min(s.w - halfW, snap.wx - s.x));
+    } else if (fs.edge === 'left' || fs.edge === 'right') {
+        fs.cx = Math.max(halfW, Math.min(s.h - halfW, snap.wy - s.y));
+    } else if (fs.edge === 'seg') {
+        const poly = s.shapeType === 'l' ? lShapePolygon(s)
+                   : s.shapeType === 'u' ? uShapePolygon(s) : null;
+        if (!poly) return;
+        const segIdx = parseInt(String(fs.segKey).replace('seg',''), 10);
+        if (segIdx < 0 || segIdx >= poly.length) return;
+        const cur = poly[segIdx], nxt = poly[(segIdx + 1) % poly.length];
+        const isHoriz = Math.abs(cur[1] - nxt[1]) < 0.5;
+        if (isHoriz) {
+            const minX = Math.min(cur[0], nxt[0]) - s.x;
+            const maxX = Math.max(cur[0], nxt[0]) - s.x;
+            fs.cx = Math.max(minX + halfW, Math.min(maxX - halfW, snap.wx - s.x));
+            fs.segY = cur[1] - s.y;
+        } else {
+            const minY = Math.min(cur[1], nxt[1]) - s.y;
+            const maxY = Math.max(cur[1], nxt[1]) - s.y;
+            fs.cx = Math.max(minY + halfW, Math.min(maxY - halfW, snap.wy - s.y));
+            fs.segY = cur[0] - s.x;
+        }
+    }
+}
 
 function fsFromCenterNormal(s, center, normal, newKey, newPolygon) {
     if (newKey === 'top' || newKey === 'bottom' || newKey === 'right' || newKey === 'left') {
@@ -1486,6 +1523,7 @@ function hitJoint(mx, my) {
 // ─────────────────────────────────────────────────────────────
 function applyResize(pos) {
     const s = byId(selected); if (!s) return;
+    const fsSnap = fsCaptureWorld(s);
     const b = resizeBase;
     const dx = snap(pos.x - resizeMouse.x), dy = snap(pos.y - resizeMouse.y);
     let { x, y, w, h } = b;
@@ -1503,6 +1541,7 @@ function applyResize(pos) {
     if (x+w > CW) w = CW-x; if (y+h > CH) h = CH-y;
     w = Math.max(INCH,w); h = Math.max(INCH,h);
     Object.assign(s, { x, y, w, h });
+    fsRestoreWorld(s, fsSnap);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1567,6 +1606,7 @@ function rotateCanonical(op, xc, yc, Ac, Hc) {
 function applyEdgeResize(dxa, dya) {
     if (!edgeResizing) return;
     const { s, kind, base } = edgeResizing;
+    const fsSnap = fsCaptureWorld(s);
     if (kind === 'rect') {
         let { x, y, w, h } = base;
         switch (edgeResizing.side) {
@@ -1599,6 +1639,7 @@ function applyEdgeResize(dxa, dya) {
     } else if (kind === 'bsp') {
         applyBspEdgeResize(s, edgeResizing.edgeIdx, dxa, dya, base);
     }
+    fsRestoreWorld(s, fsSnap);
 }
 
 function applyLEdgeResize(s, edgeIdx, dxa, dya, base) {
