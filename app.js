@@ -1236,6 +1236,7 @@ function handles(s) {
     if (s.shapeType === 'u') return [];
     if (s.shapeType === 'bsp') return [];
     if (s.shapeType === 'circle') return [];
+    if (s.parentId != null) return [];
     const { x, y, w, h } = s;
     return [
         { id:'nw', px:x,     py:y,     cur:'nw-resize' }, { id:'n',  px:x+w/2, py:y,     cur:'n-resize'  },
@@ -5884,7 +5885,9 @@ function deleteSelected() {
         persist(); render(); return;
     }
     if (selected === null) return;
-    pushUndo(); shapes = shapes.filter(s => s.id !== selected); selected = null;
+    pushUndo();
+    shapes = shapes.filter(s => s.id !== selected && s.parentId !== selected);
+    selected = null;
     persist(); render(); updateStatus();
 }
 function updateStatus() {
