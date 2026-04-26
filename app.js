@@ -221,16 +221,16 @@ const EDGE_THRESH   = 16;
 const JOINT_THRESH  = 6;
 
 const EDGE_DEFS = {
-    none:      { abbr: null,   label: 'None',              color: '#888'    },
-    pencil:    { abbr: 'PEN',  label: 'Pencil Edge',       color: '#dd0000' },
-    ogee:      { abbr: 'OGE',  label: 'Ogee Edge',         color: '#cc44cc' },
-    bullnose:  { abbr: 'BN',   label: 'Bullnose Edge',     color: '#0088dd' },
-    halfbull:  { abbr: 'HBN',  label: 'Half Bullnose',     color: '#00aa66' },
-    bevel:     { abbr: 'BEV',  label: 'Bevel Edge',        color: '#dd8800' },
-    mitered:   { abbr: 'MT',   label: 'Mitered Edge',      color: '#7a3000' },
-    special:   { abbr: 'SF',   label: 'Special Finish',    color: '#228B22' },
-    joint:     { abbr: 'JT',   label: 'Joint Edge',        color: '#e0457b' },
-    waterfall: { abbr: 'WF',   label: 'Waterfall Edge',    color: '#006688' },
+    none:      { abbr: null,   letter: null, label: 'None',              color: '#888'    },
+    pencil:    { abbr: 'PEN',  letter: 'P',  label: 'Pencil Edge',       color: '#dd0000' },
+    ogee:      { abbr: 'OGE',  letter: 'O',  label: 'Ogee Edge',         color: '#cc44cc' },
+    bullnose:  { abbr: 'BN',   letter: 'B',  label: 'Bullnose Edge',     color: '#0088dd' },
+    halfbull:  { abbr: 'HBN',  letter: 'H',  label: 'Half Bullnose',     color: '#00aa66' },
+    bevel:     { abbr: 'BEV',  letter: 'V',  label: 'Bevel Edge',        color: '#dd8800' },
+    mitered:   { abbr: 'MT',   letter: 'M',  label: 'Mitered Edge',      color: '#7a3000' },
+    special:   { abbr: 'SF',   letter: 'S',  label: 'Special Finish',    color: '#228B22' },
+    joint:     { abbr: 'JT',   letter: 'J',  label: 'Joint Edge',        color: '#e0457b' },
+    waterfall: { abbr: 'WF',   letter: 'W',  label: 'Waterfall Edge',    color: '#006688' },
 };
 // All polished subtypes — used for pricing (all use same polish rate)
 const POLISHED_TYPES = new Set(['pencil','ogee','bullnose','halfbull','bevel','polished']);
@@ -2074,11 +2074,11 @@ function drawEdgeDatum(ed, storeKey, x1, y1, x2, y2, sel, labelOffset) {
     drawBorderSegment(ctx, etype, x1, y1, x2, y2, sel);
     if (etype !== 'none') {
         const def = EDGE_DEFS[etype];
-        if (def?.abbr) {
+        const letter = def?.letter || def?.abbr;
+        if (letter) {
             const ex = x2-x1, ey = y2-y1, len = Math.hypot(ex,ey)||1;
-            const nx = ey/len, ny = -ex/len;
             ctx.save();
-            ctx.font = 'bold 9px Raleway,sans-serif';
+            ctx.font = 'bold 11px Raleway,sans-serif';
             ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
             const STEP_IN = 20;
             const lenIn = len / INCH;
@@ -2087,16 +2087,9 @@ function drawEdgeDatum(ed, storeKey, x1, y1, x2, y2, sel, labelOffset) {
                 const t = (i + 0.5) / count;
                 const cx = x1 + ex * t;
                 const cy = y1 + ey * t;
-                let lx, ly;
-                if (labelOffset && count === 1) {
-                    lx = cx + labelOffset.dx; ly = cy + labelOffset.dy;
-                } else {
-                    lx = cx + nx * 14;
-                    ly = cy + ny * 14;
-                }
-                ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,255,255,0.85)';
-                ctx.strokeText(def.abbr, lx, ly);
-                ctx.fillStyle = def.color; ctx.fillText(def.abbr, lx, ly);
+                ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+                ctx.strokeText(letter, cx, cy);
+                ctx.fillStyle = def.color; ctx.fillText(letter, cx, cy);
             }
             ctx.restore();
         }
