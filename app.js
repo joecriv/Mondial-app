@@ -888,6 +888,41 @@ function fsCenterAndNormal(s, oldPolygon) {
     return null;
 }
 
+function fsFindSegFromPoint(newPolygon, center, normal, tol) {
+    tol = tol == null ? 1.5 : tol;
+    const wantHorizSeg = Math.abs(normal[1]) > 0.5;
+    const wantVertSeg  = Math.abs(normal[0]) > 0.5;
+    let bestIdx = -1, bestDist = Infinity;
+    for (let i = 0; i < newPolygon.length; i++) {
+        const a = newPolygon[i], b = newPolygon[(i+1) % newPolygon.length];
+        const isHoriz = Math.abs(a[1] - b[1]) < 0.5;
+        const isVert  = Math.abs(a[0] - b[0]) < 0.5;
+        if (wantHorizSeg && !isHoriz) continue;
+        if (wantVertSeg  && !isVert)  continue;
+        let dist;
+        if (isHoriz) {
+            const minX = Math.min(a[0], b[0]), maxX = Math.max(a[0], b[0]);
+            if (center[0] < minX - tol || center[0] > maxX + tol) continue;
+            dist = Math.abs(center[1] - a[1]);
+        } else {
+            const minY = Math.min(a[1], b[1]), maxY = Math.max(a[1], b[1]);
+            if (center[1] < minY - tol || center[1] > maxY + tol) continue;
+            dist = Math.abs(center[0] - a[0]);
+        }
+        if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+    }
+    return (bestDist <= tol * 4) ? bestIdx : -1;
+}
+function clearStaleFsHalves(s) {
+    if (!s.edges) return;
+    const fsKey = farmSinkEdgeKey(s);
+    for (const k of Object.keys(s.edges)) {
+        if (k === fsKey) continue;
+        const e = s.edges[k];
+        if (e && (e.fsLeft || e.fsRight)) { delete e.fsLeft; delete e.fsRight; }
+    }
+}
+
 function fsFromCenterNormal(s, center, normal, newKey, newPolygon) {
     if (newKey === 'top' || newKey === 'bottom' || newKey === 'right' || newKey === 'left') {
         const cx = (newKey === 'top' || newKey === 'bottom') ? center[0] : center[1];
@@ -5370,12 +5405,15 @@ document.addEventListener('keydown', e => {
                 if (fsCN) {
                     const newCenter = [oldH_local - fsCN.center[1], fsCN.center[0]];
                     const newNormal = [-fsCN.normal[1], fsCN.normal[0]];
-                    const newSegIdx = lVertexIdxAfterRotationCW(oldNotch, oldFsSegIdx, newNotch);
                     const newPoly = lShapePolygon(s).map(p => [p[0]-s.x, p[1]-s.y]);
+                    let newSegIdx = fsFindSegFromPoint(newPoly, newCenter, newNormal);
+                    if (newSegIdx < 0) newSegIdx = lVertexIdxAfterRotationCW(oldNotch, oldFsSegIdx, newNotch);
                     const newFs = fsFromCenterNormal(s, newCenter, newNormal, 'seg' + newSegIdx, newPoly);
                     if (newFs) s.farmSink = newFs;
                 }
                 rotateJointsCW(s, oldH_local);
+                clearStaleFsHalves(s);
+                if (s.farmSink) ensureFsHalves(s, farmSinkEdgeKey(s));
                 rotatePolishUndersCW(s, oldH_local);
             } else if (s.shapeType === 'u') {
                 const oldH_local = s.h;
@@ -5390,11 +5428,15 @@ document.addEventListener('keydown', e => {
                     const newCenter = [oldH_local - fsCN.center[1], fsCN.center[0]];
                     const newNormal = [-fsCN.normal[1], fsCN.normal[0]];
                     const newPoly = uShapePolygon(s).map(p => [p[0]-s.x, p[1]-s.y]);
-                    const newFs = fsFromCenterNormal(s, newCenter, newNormal, oldFsSegKey, newPoly);
+                    let newSegIdx = fsFindSegFromPoint(newPoly, newCenter, newNormal);
+                    const newKey = newSegIdx >= 0 ? ('seg' + newSegIdx) : oldFsSegKey;
+                    const newFs = fsFromCenterNormal(s, newCenter, newNormal, newKey, newPoly);
                     if (newFs) s.farmSink = newFs;
                 }
                 rotateJointsCW(s, oldH_local);
                 rotatePolishUndersCW(s, oldH_local);
+                clearStaleFsHalves(s);
+                if (s.farmSink) ensureFsHalves(s, farmSinkEdgeKey(s));
             } else if (s.shapeType === 'circle') {
                 // No change — circles are symmetric
             } else {
