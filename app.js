@@ -908,6 +908,15 @@ function fsFromCenterNormal(s, center, normal, newKey, newPolygon) {
     return null;
 }
 
+function rotatePolishUndersCW(s, oldH_local) {
+    if (!s.polishUnders || !s.polishUnders.length) return;
+    s.polishUnders = s.polishUnders.map(r => ({
+        x: oldH_local - r.y - r.h,
+        y: r.x,
+        w: r.h,
+        h: r.w
+    }));
+}
 function rotateJointsCW(s, oldH_local) {
     if (!s.joints || !s.joints.length) return;
     const rotPt = (relX, relY) => ({ relX: oldH_local - relY, relY: relX });
@@ -5363,6 +5372,7 @@ document.addEventListener('keydown', e => {
                     if (newFs) s.farmSink = newFs;
                 }
                 rotateJointsCW(s, oldH_local);
+                rotatePolishUndersCW(s, oldH_local);
             } else if (s.shapeType === 'u') {
                 const oldH_local = s.h;
                 const oldPoly = uShapePolygon(s).map(p => [p[0]-s.x, p[1]-s.y]);
@@ -5380,6 +5390,7 @@ document.addEventListener('keydown', e => {
                     if (newFs) s.farmSink = newFs;
                 }
                 rotateJointsCW(s, oldH_local);
+                rotatePolishUndersCW(s, oldH_local);
             } else if (s.shapeType === 'circle') {
                 // No change — circles are symmetric
             } else {
@@ -5431,6 +5442,7 @@ document.addEventListener('keydown', e => {
                 }
                 const oldW = s.w; s.w = s.h; s.h = oldW;
                 rotateJointsCW(s, oldH_local);
+                rotatePolishUndersCW(s, oldH_local);
                 if (isRect && fsCN) {
                     const newCenter = [oldH_local - fsCN.center[1], fsCN.center[0]];
                     const newNormal = [-fsCN.normal[1], fsCN.normal[0]];
@@ -9536,6 +9548,67 @@ function slabDrawSlab(ctx, sd, idx, ox, oy, sc, mockupMode) {
         ctx.lineJoin = 'round';
         ctx.stroke();
 
+        // ── Polish-Under areas (carry through with piece rotation) ──
+        if (shape && shape.polishUnders && shape.polishUnders.length && p.ref.segIdx == null && !mockupMode) {
+            for (const r of shape.polishUnders) {
+                const lx0 = r.x / INCH, ly0 = r.y / INCH;
+                const lx1 = (r.x + r.w) / INCH, ly1 = (r.y + r.h) / INCH;
+                const c0 = convRot(lx0, ly0);
+                const c1 = convRot(lx1, ly0);
+                const c2 = convRot(lx1, ly1);
+                const c3 = convRot(lx0, ly1);
+                ctx.save();
+                ctx.beginPath();
+                ctx.moveTo(c0[0], c0[1]); ctx.lineTo(c1[0], c1[1]);
+                ctx.lineTo(c2[0], c2[1]); ctx.lineTo(c3[0], c3[1]);
+                ctx.closePath();
+                ctx.save();
+                ctx.clip();
+                ctx.strokeStyle = 'rgba(180,60,150,0.85)';
+                ctx.lineWidth = 1;
+                const minX = Math.min(c0[0], c1[0], c2[0], c3[0]);
+                const minY = Math.min(c0[1], c1[1], c2[1], c3[1]);
+                const maxX = Math.max(c0[0], c1[0], c2[0], c3[0]);
+                const maxY = Math.max(c0[1], c1[1], c2[1], c3[1]);
+                const bw = maxX - minX, bh = maxY - minY, step = 8;
+                for (let d = -bh; d < bw + bh; d += step) {
+                    ctx.beginPath();
+                    ctx.moveTo(minX + d,        minY);
+                    ctx.lineTo(minX + d + bh,   minY + bh);
+                    ctx.stroke();
+                }
+                ctx.restore();
+                ctx.strokeStyle = '#b03c96';
+                ctx.lineWidth = 1.2;
+                ctx.setLineDash([4, 3]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+                const sideA = Math.hypot(c1[0]-c0[0], c1[1]-c0[1]);
+                const sideB = Math.hypot(c3[0]-c0[0], c3[1]-c0[1]);
+                const useA = sideA >= sideB;
+                const ang = useA
+                    ? Math.atan2(c1[1]-c0[1], c1[0]-c0[0])
+                    : Math.atan2(c3[1]-c0[1], c3[0]-c0[0]);
+                const longSide  = useA ? sideA : sideB;
+                const shortSide = useA ? sideB : sideA;
+                let fs = Math.min(14, longSide / 7, shortSide / 1.6);
+                if (fs < 6) fs = 6;
+                const cx = (c0[0]+c1[0]+c2[0]+c3[0]) / 4;
+                const cy = (c0[1]+c1[1]+c2[1]+c3[1]) / 4;
+                ctx.save();
+                ctx.translate(cx, cy);
+                ctx.rotate(ang);
+                ctx.font = `bold ${fs}px Raleway,sans-serif`;
+                ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+                ctx.strokeText('POL. UNDER', 0, 0);
+                ctx.fillStyle = '#7a2862';
+                ctx.fillText('POL. UNDER', 0, 0);
+                ctx.restore();
+                ctx.restore();
+            }
+        }
+
         // ── label (clipped to bounding box) ────────────────────
         ctx.beginPath();
         ctx.rect(px+2, py+2, pxw-4, pxh-4);
@@ -11492,16 +11565,24 @@ function exportPDF() {
 
         y += metricsH + 10;
 
-        // ── Cutouts: sinks, farmsink, cooktop, outlets, boccis ─────
+        // ── Cutouts: sinks, farmsink, cooktop, outlets, boccis, polish-under ─
         const cutCounts = calcPageSinkCounts(page);
+        let pagePolishSqft = 0;
+        for (const s of page.shapes) {
+            if (s.subtype) continue;
+            for (const r of (s.polishUnders || [])) {
+                pagePolishSqft += (r.w * r.h) / SQFT_PX2;
+            }
+        }
         const cutRows = [];
-        if (cutCounts.overmount  > 0) cutRows.push(['Évier overmount',  cutCounts.overmount]);
-        if (cutCounts.undermount > 0) cutRows.push(['Évier undermount', cutCounts.undermount]);
-        if (cutCounts.vasque     > 0) cutRows.push(['Évier vasque',     cutCounts.vasque]);
-        if (cutCounts.farmSinks  > 0) cutRows.push(['Farmhouse sink',   cutCounts.farmSinks]);
-        if (cutCounts.cooktops   > 0) cutRows.push(['Cooktop',          cutCounts.cooktops]);
-        if (cutCounts.outlets    > 0) cutRows.push(['Outlet',           cutCounts.outlets]);
-        if (cutCounts.boccis     > 0) cutRows.push(['Bocci outlet',     cutCounts.boccis]);
+        if (cutCounts.overmount  > 0) cutRows.push(['Évier overmount',  `× ${cutCounts.overmount}`]);
+        if (cutCounts.undermount > 0) cutRows.push(['Évier undermount', `× ${cutCounts.undermount}`]);
+        if (cutCounts.vasque     > 0) cutRows.push(['Évier vasque',     `× ${cutCounts.vasque}`]);
+        if (cutCounts.farmSinks  > 0) cutRows.push(['Farmhouse sink',   `× ${cutCounts.farmSinks}`]);
+        if (cutCounts.cooktops   > 0) cutRows.push(['Cooktop',          `× ${cutCounts.cooktops}`]);
+        if (cutCounts.outlets    > 0) cutRows.push(['Outlet',           `× ${cutCounts.outlets}`]);
+        if (cutCounts.boccis     > 0) cutRows.push(['Bocci outlet',     `× ${cutCounts.boccis}`]);
+        if (pagePolishSqft > 0)      cutRows.push(['Polissage sous',   `${pagePolishSqft.toFixed(2)} sqft`]);
         if (cutRows.length > 0) {
             const cutH = 16 + cutRows.length * 11 + 6;
             checkY(cutH);
@@ -11513,11 +11594,11 @@ function exportPDF() {
             doc.setFont('helvetica', 'bold'); doc.setFontSize(7); doc.setTextColor(...BRAND);
             doc.text('DÉCOUPES / CUTOUTS', ML + 6, cy);
             cy += 9;
-            for (const [k, n] of cutRows) {
+            for (const [k, vText] of cutRows) {
                 doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(...BODY_T);
                 doc.text(k, ML + 12, cy);
                 doc.setFont('helvetica', 'bold'); doc.setFontSize(8);
-                doc.text(`× ${n}`, PW - MR - 6, cy, { align:'right' });
+                doc.text(vText, PW - MR - 6, cy, { align:'right' });
                 cy += 11;
             }
             y += cutH + 8;
