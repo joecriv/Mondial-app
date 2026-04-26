@@ -19,7 +19,7 @@ const SYNC_KEYS = ['mondial_v4', 'mondial_form', 'mondial_pricing', 'mondial_mat
 function scheduleSyncToRemote() {
     if (!currentUserId) return;
     clearTimeout(_syncTimer);
-    _syncTimer = setTimeout(_syncAllToRemote, 3000);
+    _syncTimer = setTimeout(_syncAllToRemote, 8000);
 }
 
 async function _syncAllToRemote() {
