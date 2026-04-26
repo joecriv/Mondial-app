@@ -5817,11 +5817,24 @@ function setTool(t) {
     const prompt = document.getElementById('tool-prompt');
     if (prompt) {
         const promptText = {
-            sink: 'Click on a piece to place the sink',
-            cooktop: 'Click on a piece to place the cooktop',
-            outlet: 'Click on a piece to place the outlet',
-            bocci: 'Click on a piece to place the bocci',
-            farmsink: 'Click a horizontal edge to place the farmhouse sink',
+            draw:        'Click to add a rectangle',
+            ldraw:       'Click to add an L-shape',
+            udraw:       'Click to add a U-shape',
+            bsp:         'Click to add a backsplash',
+            circle:      'Click to add a circle',
+            sink:        'Click on a piece to place a sink',
+            cooktop:     'Click on a piece to place a cooktop',
+            outlet:      'Click on a piece to place an outlet',
+            bocci:       'Click on a piece to place a bocci outlet',
+            farmsink:    'Click an edge of a piece to place a farmhouse sink',
+            radius:      'Click a corner to add a radius',
+            edge:        'Click an edge to assign the active profile',
+            splitedge:   'Click an edge to add a split point',
+            joint:       'Click inside a piece to place a joint line',
+            check:       'Click a corner to add a check (notch)',
+            polishUnder: 'Click and drag inside a piece to mark a polish-under area',
+            text:        'Click anywhere to place a text annotation',
+            measure:     'Click two points to measure the distance between them',
         };
         if (promptText[t]) {
             prompt.textContent = promptText[t];
