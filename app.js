@@ -3144,25 +3144,29 @@ function drawShape(s, sel) {
         }
     }
     if (_rotApplied) ctx.restore();
-    if (sel && _rotatable) {
-        const hp = subtypeRotateHandlePos(s);
-        ctx.save();
-        const cxR = s.x + s.w/2, cyR = s.y + s.h/2;
-        const rad = (s.rotation || 0) * Math.PI / 180;
-        const cornerLX = s.w/2, cornerLY = -s.h/2;
-        const cornerWX = cxR + cornerLX*Math.cos(rad) - cornerLY*Math.sin(rad);
-        const cornerWY = cyR + cornerLX*Math.sin(rad) + cornerLY*Math.cos(rad);
-        ctx.strokeStyle = '#5fb8c2'; ctx.lineWidth = 1;
-        ctx.setLineDash([2, 2]);
-        ctx.beginPath(); ctx.moveTo(cornerWX, cornerWY); ctx.lineTo(hp.x, hp.y); ctx.stroke();
-        ctx.setLineDash([]);
-        ctx.beginPath(); ctx.arc(hp.x, hp.y, 7, 0, Math.PI * 2);
-        ctx.fillStyle = '#5fb8c2'; ctx.fill();
-        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
-        ctx.beginPath(); ctx.arc(hp.x, hp.y, 3, -Math.PI * 0.7, Math.PI * 0.85);
-        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.2; ctx.stroke();
-        ctx.restore();
-    }
+}
+function drawSubtypeRotateHandle(s) {
+    if (!s || !s.subtype) return;
+    if (!(s.subtype === 'sink_overmount' || s.subtype === 'sink_undermount' ||
+          s.subtype === 'sink_vasque'    || s.subtype === 'cooktop')) return;
+    if (s.id !== selected) return;
+    const hp = subtypeRotateHandlePos(s);
+    ctx.save();
+    const cxR = s.x + s.w/2, cyR = s.y + s.h/2;
+    const rad = (s.rotation || 0) * Math.PI / 180;
+    const cornerLX = s.w/2, cornerLY = -s.h/2;
+    const cornerWX = cxR + cornerLX*Math.cos(rad) - cornerLY*Math.sin(rad);
+    const cornerWY = cyR + cornerLX*Math.sin(rad) + cornerLY*Math.cos(rad);
+    ctx.strokeStyle = '#5fb8c2'; ctx.lineWidth = 1;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath(); ctx.moveTo(cornerWX, cornerWY); ctx.lineTo(hp.x, hp.y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(hp.x, hp.y, 7, 0, Math.PI * 2);
+    ctx.fillStyle = '#5fb8c2'; ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.beginPath(); ctx.arc(hp.x, hp.y, 3, -Math.PI * 0.7, Math.PI * 0.85);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.2; ctx.stroke();
+    ctx.restore();
 }
 function subtypeRotateHandlePos(s) {
     const cxR = s.x + s.w/2, cyR = s.y + s.h/2;
@@ -3474,6 +3478,7 @@ function render() {
     shapes.filter(s => !s.subtype).forEach(s => drawJointLines(s));
     shapes.filter(s => !s.subtype).forEach(s => drawPolishUnders(s));
     shapes.filter(s => s.subtype).forEach(s => drawShape(s, s.id === selected));
+    shapes.filter(s => s.subtype).forEach(s => drawSubtypeRotateHandle(s));
     drawPuPreview();
     // Draw text annotations on top
     for (const ti of textItems) {
@@ -5843,10 +5848,8 @@ document.addEventListener('keydown', e => {
     }
     if (e.key === 'Escape') {
         ghostText = null;
-        selected = null; selectedJoint = null; drawing = false; dStart = null; dCur = null;
-        moving = false; resizing = false; edgeResizing = null; draggingJoint = false; jointSnapCorner = null;
-        hovCorner = null; hovEdge = null; hovCornerEdge = null; chamferPickState = null;
-        measurePt1 = null; measureHover = null; selectedMeasure = null;
+        hideAllPopups();
+        setTool('select');
         render(); updateStatus(); return;
     }
     if (e.key === 'r' || e.key === 'R') setTool('draw');
