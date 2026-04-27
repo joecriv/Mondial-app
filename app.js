@@ -261,6 +261,9 @@ let drawing = false, dStart = null, dCur = null;
 let drawingPU = false, puParent = null, puStart = null, puCur = null;
 let selectedPU = null;
 let pendingItemParent = null;
+let rotatingItemId = null;
+let rotateBaseAngle = 0;
+let rotateBaseRotation = 0;
 let pendingPlace = null;
 
 let moving = false, moveOff = null;
@@ -1299,7 +1302,16 @@ function hitShape(mx, my) {
             const r = s.w / 2;
             if (Math.hypot(mx - (s.x + r), my - (s.y + r)) <= r) return s;
         } else {
-            if (mx >= s.x && mx <= s.x+s.w && my >= s.y && my <= s.y+s.h) return s;
+            if (s.rotation) {
+                const cxR = s.x + s.w/2, cyR = s.y + s.h/2;
+                const rad = -(s.rotation || 0) * Math.PI / 180;
+                const dx = mx - cxR, dy = my - cyR;
+                const lx = dx * Math.cos(rad) - dy * Math.sin(rad) + cxR;
+                const ly = dx * Math.sin(rad) + dy * Math.cos(rad) + cyR;
+                if (lx >= s.x && lx <= s.x+s.w && ly >= s.y && ly <= s.y+s.h) return s;
+            } else {
+                if (mx >= s.x && mx <= s.x+s.w && my >= s.y && my <= s.y+s.h) return s;
+            }
         }
     }
     return null;
@@ -2821,6 +2833,17 @@ function drawShape(s, sel) {
         }
         return;
     }
+    let _rotApplied = false;
+    const _rotatable = (s.subtype === 'sink_overmount' || s.subtype === 'sink_undermount' ||
+                       s.subtype === 'sink_vasque'    || s.subtype === 'cooktop');
+    if (_rotatable && (s.rotation || 0) !== 0) {
+        const _cxR = s.x + s.w/2, _cyR = s.y + s.h/2;
+        ctx.save();
+        ctx.translate(_cxR, _cyR);
+        ctx.rotate((s.rotation || 0) * Math.PI / 180);
+        ctx.translate(-_cxR, -_cyR);
+        _rotApplied = true;
+    }
     const r = shapeRadii(s);
     const ch = shapeChamfers(s);
     const chB = shapeChamfersB(s);
@@ -3120,6 +3143,42 @@ function drawShape(s, sel) {
             ctx.strokeRect(h.px-hw, h.py-hw, HND, HND);
         }
     }
+    if (_rotApplied) ctx.restore();
+    if (sel && _rotatable) {
+        const hp = subtypeRotateHandlePos(s);
+        ctx.save();
+        const cxR = s.x + s.w/2, cyR = s.y + s.h/2;
+        const rad = (s.rotation || 0) * Math.PI / 180;
+        const cornerLX = s.w/2, cornerLY = -s.h/2;
+        const cornerWX = cxR + cornerLX*Math.cos(rad) - cornerLY*Math.sin(rad);
+        const cornerWY = cyR + cornerLX*Math.sin(rad) + cornerLY*Math.cos(rad);
+        ctx.strokeStyle = '#5fb8c2'; ctx.lineWidth = 1;
+        ctx.setLineDash([2, 2]);
+        ctx.beginPath(); ctx.moveTo(cornerWX, cornerWY); ctx.lineTo(hp.x, hp.y); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.beginPath(); ctx.arc(hp.x, hp.y, 7, 0, Math.PI * 2);
+        ctx.fillStyle = '#5fb8c2'; ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+        ctx.beginPath(); ctx.arc(hp.x, hp.y, 3, -Math.PI * 0.7, Math.PI * 0.85);
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.2; ctx.stroke();
+        ctx.restore();
+    }
+}
+function subtypeRotateHandlePos(s) {
+    const cxR = s.x + s.w/2, cyR = s.y + s.h/2;
+    const rad = (s.rotation || 0) * Math.PI / 180;
+    const lx = s.w/2 + 12, ly = -s.h/2 - 12;
+    return {
+        x: cxR + lx*Math.cos(rad) - ly*Math.sin(rad),
+        y: cyR + lx*Math.sin(rad) + ly*Math.cos(rad)
+    };
+}
+function hitSubtypeRotateHandle(s, mx, my) {
+    if (!s || !s.subtype) return false;
+    if (!(s.subtype === 'sink_overmount' || s.subtype === 'sink_undermount' ||
+          s.subtype === 'sink_vasque'    || s.subtype === 'cooktop')) return false;
+    const hp = subtypeRotateHandlePos(s);
+    return Math.hypot(mx - hp.x, my - hp.y) <= 10;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -5305,10 +5364,20 @@ cv.addEventListener('mousedown', e => {
         render();
         return;
     }
+    if (selected !== null) {
+        const sel_s = byId(selected);
+        if (sel_s && hitSubtypeRotateHandle(sel_s, p.x, p.y)) {
+            const cxR = sel_s.x + sel_s.w/2, cyR = sel_s.y + sel_s.h/2;
+            rotatingItemId = sel_s.id;
+            rotateBaseAngle = Math.atan2(p.y - cyR, p.x - cxR);
+            rotateBaseRotation = sel_s.rotation || 0;
+            pushUndo();
+            return;
+        }
+    }
     const hit = hitShape(p.x, p.y);
     if (hit) {
         if (selected !== hit.id) { selected = hit.id; selectedJoint = null; render(); }
-        // Check if click is inside this shape's farmhouse sink cutout
         selectedFarmSinkShapeId = null;
         if (hit.farmSink) {
             const fr = farmSinkRectAbs(hit);
@@ -5404,6 +5473,19 @@ cv.addEventListener('mousemove', e => {
         const dya = snap(p.y - edgeResizing.mouse.y);
         applyEdgeResize(dxa, dya);
         render();
+        return;
+    }
+    if (rotatingItemId !== null) {
+        const s = byId(rotatingItemId);
+        if (s) {
+            const cxR = s.x + s.w/2, cyR = s.y + s.h/2;
+            const cur = Math.atan2(p.y - cyR, p.x - cxR);
+            let deg = rotateBaseRotation + (cur - rotateBaseAngle) * 180 / Math.PI;
+            deg = ((deg % 360) + 360) % 360;
+            if (e.shiftKey) deg = Math.round(deg / 15) * 15;
+            s.rotation = deg;
+            render();
+        }
         return;
     }
     if (moving) {
@@ -5538,6 +5620,7 @@ cv.addEventListener('mouseup', e => {
     if (resizingDiag) { resizingDiag = false; resizeDiagBase = null; persist(); }
     if (movingDiag) { movingDiag = false; persist(); }
     if (movingText) { movingText = false; moveTextStart = null; persist(); }
+    if (rotatingItemId !== null) { rotatingItemId = null; persist(); }
     if (moving)     { moving   = false; persist(); }
     if (resizing)   { resizing = false; resizeH = null; persist(); }
     if (edgeResizing) { edgeResizing = null; persist(); }
