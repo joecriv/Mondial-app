@@ -1234,12 +1234,14 @@ function load() {
 // ─────────────────────────────────────────────────────────────
 //  Hit testing
 // ─────────────────────────────────────────────────────────────
+function isLocked(s) { return s && s.locked !== false; }
 function handles(s) {
     if (s.shapeType === 'l') return [];
     if (s.shapeType === 'u') return [];
     if (s.shapeType === 'bsp') return [];
     if (s.shapeType === 'circle') return [];
     if (s.parentId != null) return [];
+    if (isLocked(s)) return [];
     const { x, y, w, h } = s;
     return [
         { id:'nw', px:x,     py:y,     cur:'nw-resize' }, { id:'n',  px:x+w/2, py:y,     cur:'n-resize'  },
@@ -1663,6 +1665,7 @@ function hitShapeLine(mx, my) {
     for (let i = shapes.length - 1; i >= 0; i--) {
         const s = shapes[i];
         if (s.subtype) continue;
+        if (isLocked(s)) continue;
         if (s.shapeType === 'rect') {
             const edges = [
                 ['top',    s.x,     s.y,       s.x+s.w, s.y    ],
@@ -3459,6 +3462,7 @@ function drawPreview() {
 }
 
 function render() {
+    if (typeof refreshLockBtn === 'function') refreshLockBtn();
     dimLabelRects = [];
     dimClickTargets = [];
     // Grid
@@ -5998,6 +6002,40 @@ Object.entries(TOOL_BTNS).forEach(([t,id]) => document.getElementById(id).addEve
 }));
 document.getElementById('btn-delete').addEventListener('click', deleteSelected);
 document.getElementById('btn-undo').addEventListener('click', undo);
+
+function toggleLockSelected() {
+    const s = byId(selected);
+    if (!s) return;
+    pushUndo();
+    s.locked = !isLocked(s);
+    persist();
+    refreshLockBtn();
+    render();
+}
+function refreshLockBtn() {
+    const btn = document.getElementById('btn-lock');
+    if (!btn) return;
+    const s = byId(selected);
+    if (!s || s.subtype || s.parentId != null) {
+        btn.textContent = '🔒 Lock';
+        btn.disabled = true;
+        btn.style.opacity = '0.45';
+        btn.classList.remove('active');
+        return;
+    }
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    if (isLocked(s)) {
+        btn.textContent = '🔒 Locked';
+        btn.classList.add('active');
+        btn.title = 'This piece is locked for resizing. Click to unlock.';
+    } else {
+        btn.textContent = '🔓 Unlocked';
+        btn.classList.remove('active');
+        btn.title = 'This piece is unlocked — drag handles or edges to resize. Click to lock.';
+    }
+}
+document.getElementById('btn-lock').addEventListener('click', toggleLockSelected);
 
 // ─────────────────────────────────────────────────────────────
 //  Phase 3 — Right panel form
