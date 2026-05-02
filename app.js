@@ -1,6 +1,20 @@
 'use strict';
 
 // ─────────────────────────────────────────────────────────────
+//  Auto-fit — shrink the UI on narrow screens (low-res monitors)
+// ─────────────────────────────────────────────────────────────
+(function autoFit() {
+    const TARGET = 1500;
+    function apply() {
+        const z = Math.min(1, window.innerWidth / TARGET);
+        document.body.style.zoom = z;
+    }
+    if (document.body) apply();
+    else document.addEventListener('DOMContentLoaded', apply);
+    window.addEventListener('resize', apply);
+})();
+
+// ─────────────────────────────────────────────────────────────
 //  Clerk auth + Supabase client
 // ─────────────────────────────────────────────────────────────
 let currentUserId = null;   // Set after Clerk sign-in
