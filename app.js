@@ -9700,7 +9700,7 @@ function slabRefreshSlabList() {
     // Add slab — always uses 126×63 default; user can edit independently after
     const btnAdd = document.getElementById('slab-add-btn');
     if (btnAdd) btnAdd.addEventListener('click', () => {
-        if (slabDefs.length >= 4) return;
+        if (slabDefs.length >= 8) return;
         slabDefs.push({ w: 126, h: 63, deadZone: 0.5 });
         slabRefreshSlabList();
         slabRender();
